@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+
+# Parse .barbatos-ignore.yml
+# Reads ignore rules from target repository and exports them for filtering
+
+# Source shared colours (safe whether executed or sourced)
+_PBI_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./common.sh
+source "$_PBI_DIR/common.sh"
+unset _PBI_DIR
+
+# Main parsing function (so this can be sourced without exiting)
+parse_ignore_rules() {
+    local IGNORE_FILE="${1:-}"
+    
+    if [[ -z "$IGNORE_FILE" ]]; then
+        IGNORE_FILE="${TARGET_DIR:-}/.barbatos-ignore.yml"
+    fi
+    
+    local IGNORE_CACHE="${IGNORE_CACHE:-/tmp/barbatos-ignore-cache.json}"
+
+    # Check if ignore file exists
+    if [[ ! -f "$IGNORE_FILE" ]]; then
+        # No ignore file - create empty cache
+        echo '{"ignores": []}' > "$IGNORE_CACHE" 2>/dev/null || true
+        return 0
+    fi
+
+    echo -e "${CYAN}📋 Parsing ignore file: $IGNORE_FILE${NC}"
+    
+    # Show first few lines of YAML for debugging
+    echo -e "${CYAN}📄 YAML file content (first 10 lines):${NC}"
+    head -10 "$IGNORE_FILE" 2>/dev/null || true
+
+    # Parse YAML to JSON using Python (more reliable than yq in bash).
+    # The file path is passed as sys.argv[1] — never interpolated into code —
+    # preventing shell injection if the path contains quotes or special characters.
+    local PARSE_OUTPUT
+    PARSE_OUTPUT=$(python3 - "$IGNORE_FILE" 2>&1 <<'PYEOF'
+import sys
+import json
+from datetime import datetime
+
+IGNORE_FILE = sys.argv[1]
+
+try:
+    import yaml
+except ImportError:
+    print(json.dumps({'ignores': [], 'error': 'PyYAML module not installed'}), file=sys.stderr)
+    print(json.dumps({'ignores': []}))
+    sys.exit(0)
+
+try:
+    with open(IGNORE_FILE, 'r') as f:
+        data = yaml.safe_load(f)
+
+    if not data or 'ignores' not in data:
+        print(json.dumps({'ignores': []}))
+        sys.exit(0)
+
+    processed = []
+    current_date = datetime.now()
+
+    for ignore in data.get('ignores', []):
+        ignore_entry = {
+            'type': ignore.get('type', ''),
+            'value': ignore.get('value', ''),
+            'reason': ignore.get('reason', ''),
+            'expires': ignore.get('expires', ''),
+            'approved_by': ignore.get('approved_by', ''),
+            'paths': ignore.get('paths', []),
+            'expired': False
+        }
+        if ignore_entry['expires']:
+            try:
+                expire_date = datetime.strptime(ignore_entry['expires'], '%Y-%m-%d')
+                if current_date > expire_date:
+                    ignore_entry['expired'] = True
+            except Exception:
+                pass
+        processed.append(ignore_entry)
+
+    print(json.dumps({'ignores': processed}, indent=2))
+
+except yaml.YAMLError as e:
+    print(json.dumps({'ignores': [], 'error': str(e)}), file=sys.stderr)
+    print(json.dumps({'ignores': []}))
+    sys.exit(0)
+except Exception as e:
+    print(json.dumps({'ignores': [], 'error': str(e)}), file=sys.stderr)
+    print(json.dumps({'ignores': []}))
+    sys.exit(0)
+PYEOF
+)
+    
+    echo "$PARSE_OUTPUT" | grep -v '"error"' > "$IGNORE_CACHE" 2>/dev/null || echo '{"ignores": []}' > "$IGNORE_CACHE"
+    
+    # Check for errors in output
+    if echo "$PARSE_OUTPUT" | grep -q '"error"'; then
+        local error_msg=$(echo "$PARSE_OUTPUT" | jq -r '.error // empty' 2>/dev/null)
+        if [[ -n "$error_msg" ]]; then
+            echo -e "${YELLOW}⚠️  YAML parsing error: $error_msg${NC}"
+        fi
+    fi
+
+# Count and report
+TOTAL_IGNORES=$(jq '.ignores | length' "$IGNORE_CACHE" 2>/dev/null || echo "0")
+EXPIRED_IGNORES=$(jq '[.ignores[] | select(.expired == true)] | length' "$IGNORE_CACHE" 2>/dev/null || echo "0")
+
+if [[ $TOTAL_IGNORES -gt 0 ]]; then
+    echo -e "${CYAN}  ✓ Loaded $TOTAL_IGNORES ignore rule(s)${NC}"
+    
+    if [[ $EXPIRED_IGNORES -gt 0 ]]; then
+        echo -e "${YELLOW}  ⚠️  Warning: $EXPIRED_IGNORES ignore rule(s) have expired${NC}"
+        jq -r '.ignores[] | select(.expired == true) | "    - \(.type): \(.value) (expired: \(.expires))"' "$IGNORE_CACHE" 2>/dev/null || true
+    fi
+fi
+}
+
+# If script is executed (not sourced), run the function
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    TARGET_DIR="${TARGET_DIR:-}"
+    IGNORE_FILE="${TARGET_DIR}/.barbatos-ignore.yml"
+    IGNORE_CACHE="/tmp/barbatos-ignore-cache.json"
+    parse_ignore_rules "$IGNORE_FILE"
+    exit 0
+fi

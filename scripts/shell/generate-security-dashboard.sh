@@ -1,0 +1,6779 @@
+#!/usr/bin/env bash
+
+# Generate Interactive Security Dashboard
+# Creates an interactive HTML dashboard with expandable tool sections showing detailed vulnerabilities
+
+# Enable error output for debugging
+set -eo pipefail
+# set +u: disabled intentionally — sourced scripts may reference unset vars
+set +u
+
+# Trap errors for debugging
+trap 'echo "ERROR: Dashboard generation failed at line $LINENO with exit code $?" >&2' ERR
+
+# Force C locale so macOS BSD sed handles UTF-8 bytes in scan data without
+# "illegal byte sequence" errors. ASCII-only characters (&, <, >) are still
+# matched correctly; non-ASCII bytes pass through unchanged.
+export LC_ALL=C
+
+# Colors for help output
+WHITE='\033[1;37m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+BLUE='\033[0;34m'
+PURPLE='\033[0;35m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+# Display BARBATOS banner
+echo -e "${CYAN}"
+cat << "EOF"
+███████╗██████╗ ██╗   ██╗ ██████╗ ███╗   ██╗
+██╔════╝██╔══██╗╚██╗ ██╔╝██╔═══██╗████╗  ██║
+█████╗  ██████╔╝ ╚████╔╝ ██║   ██║██╔██╗ ██║
+██╔══╝  ██╔═══╝   ╚██╔╝  ██║   ██║██║╚██╗██║
+███████╗██║        ██║   ╚██████╔╝██║ ╚████║
+╚══════╝╚═╝        ╚═╝    ╚═════╝ ╚═╝  ╚═══╝
+EOF
+echo -e "${NC}"
+echo -e "${GREEN}Absolute Security Control - Dashboard Generator${NC}"
+echo ""
+
+# Help function
+show_help() {
+    echo -e "${WHITE}Interactive Security Dashboard Generator${NC}"
+    echo ""
+    echo "Usage: $0 [OPTIONS]"
+    echo ""
+    echo "Creates an interactive HTML dashboard consolidating all security scan results"
+    echo "with expandable sections, filtering, sorting, and detailed vulnerability views."
+    echo ""
+    echo "Options:"
+    echo "  -h, --help          Show this help message and exit"
+    echo ""
+    echo "Environment Variables:"
+    echo "  SCAN_DIR                Specific scan directory to generate dashboard for"
+    echo "                          (default: auto-detects latest scan)"
+    echo "  CLASSIFICATION_LEVEL    Classification banner to display on all pages"
+    echo "                          Values: INTERNAL (default), CUI, SBU, FOUO,"
+    echo "                                  CONFIDENTIAL, SECRET, TOP_SECRET,"
+    echo "                                  UNCLASSIFIED, NONE"
+    echo "                          Example: CLASSIFICATION_LEVEL=CUI $0"
+    echo ""
+    echo "Output:"
+    echo "  Dashboard saved to: {SCAN_DIR}/consolidated-reports/dashboards/security-dashboard.html"
+    echo "  Root shortcut:      {SCAN_DIR}/security-dashboard.html  (symlink)"
+    echo ""
+    echo "Dashboard Features:"
+    echo "  - Severity summary with clickable filter chips"
+    echo "  - Expandable sections for each security tool"
+    echo "  - Detailed vulnerability information"
+    echo "  - False positive assessment checklists"
+    echo "  - SBOM package viewer with search"
+    echo "  - Sortable and filterable findings"
+    echo "  - CWE IDs, PURL, and CVE links"
+    echo ""
+    echo "Supported Tools:"
+    echo "  - Trivy (container vulnerabilities)"
+    echo "  - Grype (dependency vulnerabilities)"
+    echo "  - TruffleHog (secret detection)"
+    echo "  - Checkov (IaC security)"
+    echo "  - ClamAV (malware detection)"
+    echo "  - Xeol (EOL detection)"
+    echo "  - Garak (LLM security probing)"
+    echo "  - SBOM (software inventory)"
+    echo "  - SonarQube (code quality)"
+    echo ""
+    echo "Examples:"
+    echo "  $0                              # Generate for latest scan"
+    echo "  SCAN_DIR=/path/to/scan $0       # Generate for specific scan"
+    echo ""
+    echo "Notes:"
+    echo "  - Requires jq to be installed"
+    echo "  - Auto-detects latest scan in scans/ directory"
+    exit 0
+}
+
+# Parse arguments
+for arg in "$@"; do
+    case $arg in
+        -h|--help)
+            show_help
+            ;;
+    esac
+done
+
+# Get script directory
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./common.sh
+source "$SCRIPT_DIR/common.sh"
+WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
+echo "DEBUG: SCRIPT_DIR=$SCRIPT_DIR" >&2
+echo "DEBUG: WORKSPACE_ROOT=$WORKSPACE_ROOT" >&2
+
+# Get BARBATOS version via shared helper\nresolve_barbatos_version "$WORKSPACE_ROOT"\necho "BARBATOS Version: $BARBATOS_VERSION" >&2
+
+# ── Classification Banner Configuration ────────────────────────────────────────
+# Supported levels: INTERNAL (default), UNCLASSIFIED, CUI, SBU, FOUO,
+#                   CONFIDENTIAL, SECRET, TOP_SECRET, NONE
+CLASSIFICATION_LEVEL="${CLASSIFICATION_LEVEL:-INTERNAL}"
+
+case "$(echo "${CLASSIFICATION_LEVEL}" | tr '[:lower:]' '[:upper:]')" in
+    NONE|"")
+        CLASS_LABEL=""
+        CLASS_BG=""
+        CLASS_TEXT_COLOR=""
+        CLASS_SHOW_BANNER="false"
+        ;;
+    UNCLASSIFIED)
+        CLASS_LABEL="UNCLASSIFIED"
+        CLASS_BG="#007a33"
+        CLASS_TEXT_COLOR="#ffffff"
+        CLASS_SHOW_BANNER="true"
+        ;;
+    INTERNAL)
+        CLASS_LABEL="INTERNAL USE ONLY"
+        CLASS_BG="#1a56db"
+        CLASS_TEXT_COLOR="#ffffff"
+        CLASS_SHOW_BANNER="true"
+        ;;
+    SBU|SENSITIVE)
+        CLASS_LABEL="SENSITIVE BUT UNCLASSIFIED // SBU"
+        CLASS_BG="#0369a1"
+        CLASS_TEXT_COLOR="#ffffff"
+        CLASS_SHOW_BANNER="true"
+        ;;
+    CUI)
+        CLASS_LABEL="CONTROLLED UNCLASSIFIED INFORMATION // CUI"
+        CLASS_BG="#6d28d9"
+        CLASS_TEXT_COLOR="#ffffff"
+        CLASS_SHOW_BANNER="true"
+        ;;
+    FOUO)
+        CLASS_LABEL="FOR OFFICIAL USE ONLY // FOUO"
+        CLASS_BG="#0369a1"
+        CLASS_TEXT_COLOR="#ffffff"
+        CLASS_SHOW_BANNER="true"
+        ;;
+    CONFIDENTIAL)
+        CLASS_LABEL="CONFIDENTIAL"
+        CLASS_BG="#1d4ed8"
+        CLASS_TEXT_COLOR="#ffffff"
+        CLASS_SHOW_BANNER="true"
+        ;;
+    SECRET)
+        CLASS_LABEL="SECRET"
+        CLASS_BG="#b91c1c"
+        CLASS_TEXT_COLOR="#ffffff"
+        CLASS_SHOW_BANNER="true"
+        ;;
+    TOP_SECRET|TS)
+        CLASS_LABEL="TOP SECRET"
+        CLASS_BG="#f59e0b"
+        CLASS_TEXT_COLOR="#000000"
+        CLASS_SHOW_BANNER="true"
+        ;;
+    *)
+        # Custom label passed verbatim
+        CLASS_LABEL="${CLASSIFICATION_LEVEL}"
+        CLASS_BG="#1a56db"
+        CLASS_TEXT_COLOR="#ffffff"
+        CLASS_SHOW_BANNER="true"
+        ;;
+esac
+
+echo "Classification level: ${CLASSIFICATION_LEVEL}" >&2
+# ───────────────────────────────────────────────────────────────────────────────
+
+# Source filter-ignored-findings.sh for suppression functionality
+if [ -f "$SCRIPT_DIR/filter-ignored-findings.sh" ]; then
+    echo "DEBUG: Sourcing filter-ignored-findings.sh" >&2
+    # shellcheck source=/dev/null
+    set +e
+    source "$SCRIPT_DIR/filter-ignored-findings.sh" 2>/dev/null
+    set -e
+fi
+
+# Source parse-barbatos-ignore.sh for ignore rule parsing
+if [ -f "$SCRIPT_DIR/parse-barbatos-ignore.sh" ]; then
+    echo "DEBUG: Sourcing parse-barbatos-ignore.sh" >&2
+    # shellcheck source=/dev/null
+    set +e
+    source "$SCRIPT_DIR/parse-barbatos-ignore.sh" 2>/dev/null
+    set -e
+fi
+
+# Default paths
+SCANS_DIR="${WORKSPACE_ROOT}/scans"
+
+# Use SCAN_DIR if provided, otherwise auto-detect latest
+if [[ -n "${SCAN_DIR:-}" ]]; then
+    LATEST_SCAN="$SCAN_DIR"
+    echo "Using provided scan directory: $(basename "$LATEST_SCAN")"
+else
+    # Get the most recent scan directory (any username)
+    LATEST_SCAN=$(find "$SCANS_DIR" -maxdepth 1 -type d -name "*_*_*" 2>/dev/null | sort -r | head -n 1)
+    
+    if [ -z "$LATEST_SCAN" ]; then
+        echo "❌ No scan directories found in $SCANS_DIR" >&2
+        exit 1
+    fi
+    
+    echo "🔍 Auto-detected latest scan: $(basename "$LATEST_SCAN")"
+fi
+
+SCAN_NAME=$(basename "$LATEST_SCAN")
+echo "Generating interactive dashboard from: $SCAN_NAME"
+echo "DEBUG: LATEST_SCAN=$LATEST_SCAN" >&2
+
+# Set output to the scan directory's consolidated reports
+OUTPUT_DIR="${LATEST_SCAN}/consolidated-reports/dashboards"
+OUTPUT_HTML="${OUTPUT_DIR}/security-dashboard.html"
+echo "DEBUG: OUTPUT_DIR=$OUTPUT_DIR" >&2
+echo "DEBUG: OUTPUT_HTML=$OUTPUT_HTML" >&2
+
+# Initialize ignore rules if parse function is available
+if declare -f parse_ignore_rules >/dev/null 2>&1; then
+    # Try multiple possible locations for .barbatos-ignore.yml
+    IGNORE_FILE=""
+    for possible_path in "${TARGET_DIR:-}/.barbatos-ignore.yml" "${WORKSPACE_ROOT}/.barbatos-ignore.yml" "${LATEST_SCAN}/../../.barbatos-ignore.yml" "$(pwd)/.barbatos-ignore.yml"; do
+        if [ -f "$possible_path" ]; then
+            IGNORE_FILE="$possible_path"
+            break
+        fi
+    done
+    
+    if [ -n "$IGNORE_FILE" ] && [ -f "$IGNORE_FILE" ]; then
+        export IGNORE_CACHE="/tmp/barbatos-ignore-cache-dashboard-$$.json"
+        export SUPPRESSED_LOG="${LATEST_SCAN}/suppressed-findings.md"
+        echo "📋 Using ignore rules from: $IGNORE_FILE"
+        parse_ignore_rules "$IGNORE_FILE" 2>/dev/null || true
+    fi
+fi
+
+# ============================================
+# COLLECT DETAILED STATISTICS FROM EACH TOOL
+# ============================================
+
+# Get target directory from scan ID
+TARGET_NAME=$(echo "$SCAN_NAME" | cut -d'_' -f1)
+SCAN_USER=$(echo "$SCAN_NAME" | cut -d'_' -f2)
+SCAN_TIMESTAMP=$(echo "$SCAN_NAME" | cut -d'_' -f3-)
+
+# ---- Read Scan Metadata (File Statistics) ----
+SCAN_METADATA_FILE="${LATEST_SCAN}/scan-metadata.json"
+TOTAL_FILES_SCANNED=0
+JS_TS_FILES=0
+PYTHON_FILES=0
+YAML_FILES=0
+JSON_CONFIG_FILES=0
+TERRAFORM_FILES=0
+DOCKERFILE_COUNT=0
+SHELL_SCRIPT_FILES=0
+TARGET_DIRECTORY="N/A"
+
+if [ -f "$SCAN_METADATA_FILE" ] && command -v jq &> /dev/null; then
+    echo "📊 Reading scan metadata from: $SCAN_METADATA_FILE"
+    TOTAL_FILES_SCANNED=$(jq -r '.file_statistics.total_files // 0' "$SCAN_METADATA_FILE" 2>/dev/null || echo "0")
+    JS_TS_FILES=$(jq -r '.file_statistics.javascript_typescript // 0' "$SCAN_METADATA_FILE" 2>/dev/null || echo "0")
+    PYTHON_FILES=$(jq -r '.file_statistics.python // 0' "$SCAN_METADATA_FILE" 2>/dev/null || echo "0")
+    YAML_FILES=$(jq -r '.file_statistics.yaml_yml // 0' "$SCAN_METADATA_FILE" 2>/dev/null || echo "0")
+    JSON_CONFIG_FILES=$(jq -r '.file_statistics.json // 0' "$SCAN_METADATA_FILE" 2>/dev/null || echo "0")
+    TERRAFORM_FILES=$(jq -r '.file_statistics.terraform // 0' "$SCAN_METADATA_FILE" 2>/dev/null || echo "0")
+    DOCKERFILE_COUNT=$(jq -r '.file_statistics.dockerfiles // 0' "$SCAN_METADATA_FILE" 2>/dev/null || echo "0")
+    SHELL_SCRIPT_FILES=$(jq -r '.file_statistics.shell_scripts // 0' "$SCAN_METADATA_FILE" 2>/dev/null || echo "0")
+    TARGET_DIRECTORY=$(jq -r '.target_directory // "N/A"' "$SCAN_METADATA_FILE" 2>/dev/null || echo "N/A")
+    echo "✅ Loaded file statistics: $TOTAL_FILES_SCANNED total files"
+else
+    echo "⚠️  No scan metadata found - file counts will show as 0"
+    echo "   Run a new scan to generate file statistics"
+fi
+
+# ---- Load Scan Manifest for modal display ----
+SCAN_MANIFEST_FILE="${LATEST_SCAN}/scan-manifest.json"
+SCAN_MANIFEST_JSON="null"
+if [ -f "$SCAN_MANIFEST_FILE" ] && command -v jq &> /dev/null; then
+    echo "📋 Loading scan manifest from: $SCAN_MANIFEST_FILE"
+    SCAN_MANIFEST_JSON=$(jq -c '.' "$SCAN_MANIFEST_FILE" 2>/dev/null || echo "null")
+    if [ "$SCAN_MANIFEST_JSON" = "null" ]; then
+        echo "⚠️  Failed to parse scan manifest JSON"
+    else
+        # Escape for safe HTML embedding: replace </ with <\/ to prevent script tag injection
+        SCAN_MANIFEST_JSON=$(echo "$SCAN_MANIFEST_JSON" | sed 's|</|<\\/|g')
+        echo "✅ Scan manifest loaded"
+    fi
+else
+    echo "ℹ️  No scan manifest found - manifest button will be disabled"
+fi
+
+# ---- Load Remediation Suggestions for inline display ----
+REMEDIATION_FILE="${LATEST_SCAN}/remediation-suggestions.json"
+REMEDIATION_DATA_FILE="/tmp/remediation_map_$$.txt"
+if [ -f "$REMEDIATION_FILE" ] && command -v jq &> /dev/null; then
+    echo "💊 Loading remediation suggestions for inline display..."
+    jq -r '.remediations[] | "\(.cve)|\(.package.name)|\(.package.fixed_version)|\(.remediation.update_command)"' "$REMEDIATION_FILE" 2>/dev/null > "$REMEDIATION_DATA_FILE"
+fi
+
+# ---- Load enrichment data (NVD + CISA KEV) from security-findings-summary.json ----
+ENRICHMENT_DATA_FILE="/tmp/enrichment_map_$$.txt"
+FINDINGS_SUMMARY_FOR_ENRICH="${LATEST_SCAN}/security-findings-summary.json"
+KEV_IDS_FILE="/tmp/kev_ids_$$.txt"
+touch "$ENRICHMENT_DATA_FILE" "$KEV_IDS_FILE"
+if [ -f "$FINDINGS_SUMMARY_FOR_ENRICH" ] && command -v jq &> /dev/null; then
+    echo "🔍 Loading NVD + CISA KEV enrichment data..."
+    # Build lookup: CVE_ID|nvd_url|nvd_cvss_v3_score|nvd_cvss_v3_severity|nvd_published|cisa_kev|cisa_due_date|cisa_required_action|cisa_known_ransomware
+    jq -r '
+        [.critical_findings[], .high_findings[], .medium_findings[], .low_findings[]] |
+        .[] |
+        select(.nvd_url or .cisa_kev == true) |
+        [
+            (.vulnerability_id // .id // ""),
+            (.nvd_url // ""),
+            (.nvd_cvss_v3_score // "" | tostring),
+            (.nvd_cvss_v3_severity // ""),
+            (.nvd_published // ""),
+            (if .cisa_kev then "true" else "false" end),
+            (.cisa_due_date // ""),
+            (.cisa_required_action // ""),
+            (if .cisa_known_ransomware then "true" else "false" end)
+        ] | join("|")
+    ' "$FINDINGS_SUMMARY_FOR_ENRICH" 2>/dev/null > "$ENRICHMENT_DATA_FILE"
+
+    # Separate KEV IDs file for quick lookup
+    jq -r '
+        [.critical_findings[], .high_findings[], .medium_findings[], .low_findings[]] |
+        .[] | select(.cisa_kev == true) | (.vulnerability_id // .id // "")
+    ' "$FINDINGS_SUMMARY_FOR_ENRICH" 2>/dev/null > "$KEV_IDS_FILE"
+
+    enrich_count=$(wc -l < "$ENRICHMENT_DATA_FILE" | tr -d ' ')
+    kev_count=$(wc -l < "$KEV_IDS_FILE" | tr -d ' ')
+    echo "  ✅ Enrichment loaded: $enrich_count CVEs with NVD data, $kev_count flagged as CISA KEV"
+fi
+
+# Function to get remediation for a CVE and package
+get_remediation() {
+    local cve="$1"
+    local pkg="$2"
+    if [ -f "$REMEDIATION_DATA_FILE" ]; then
+        grep "^${cve}|${pkg}|" "$REMEDIATION_DATA_FILE" 2>/dev/null || echo ""
+    fi
+}
+
+# Function to get enrichment data for a CVE
+get_enrichment() {
+    local cve="$1"
+    if [ -f "$ENRICHMENT_DATA_FILE" ]; then
+        grep "^${cve}|" "$ENRICHMENT_DATA_FILE" 2>/dev/null | head -1 || echo ""
+    fi
+}
+
+# Function to check if CVE is in CISA KEV
+is_kev() {
+    local cve="$1"
+    [ -f "$KEV_IDS_FILE" ] && grep -qxF "$cve" "$KEV_IDS_FILE" 2>/dev/null
+}
+
+# Function to inject remediation into vulnerability HTML
+inject_remediation() {
+    local cve="$1"
+    local pkg="$2"
+
+    # ── CISA KEV banner ──────────────────────────────────────────────────────
+    if is_kev "$cve"; then
+        local enrich_row
+        enrich_row=$(get_enrichment "$cve")
+        local due_date="" required_action="" is_ransomware=""
+        if [ -n "$enrich_row" ]; then
+            IFS='|' read -r _id _url _score _sev _pub _kev due_date required_action is_ransomware <<< "$enrich_row"
+        fi
+        echo "<div class=\"detail-section\" style=\"background: linear-gradient(135deg, #3b0000 0%, #5c1a00 100%); border-left: 4px solid #dc2626; padding: 15px; margin: 10px 0 6px 0; border-radius: 6px;\">"
+        echo "<h5 style=\"color: #f87171; margin-bottom: 8px;\">🔥 ACTIVELY EXPLOITED — CISA Known Exploited Vulnerability</h5>"
+        if [ -n "$due_date" ]; then
+            echo "<div style=\"margin: 6px 0; font-size:0.9em;\"><strong style=\"color:#fca5a5;\">CISA Remediation Due:</strong> <span style=\"color:#fde68a;\">$due_date</span></div>"
+        fi
+        if [ -n "$required_action" ]; then
+            echo "<div style=\"margin: 6px 0; font-size:0.88em; color:#fca5a5;\"><strong>Required Action:</strong> $required_action</div>"
+        fi
+        if [ "$is_ransomware" = "true" ]; then
+            echo "<div style=\"margin: 6px 0; font-size:0.85em; background:#4c0519; border-radius:4px; padding:6px 10px; color:#fda4af;\">⚠️ <strong>Associated with ransomware campaigns</strong></div>"
+        fi
+        echo "<div style=\"margin-top:8px; font-size:0.8em;\"><a href=\"https://www.cisa.gov/known-exploited-vulnerabilities-catalog\" target=\"_blank\" rel=\"noopener\" style=\"color:#f87171;\">→ CISA KEV Catalog</a></div>"
+        echo "</div>"
+    fi
+
+    # ── NVD reference link ───────────────────────────────────────────────────
+    local enrich_row
+    enrich_row=$(get_enrichment "$cve")
+    if [ -n "$enrich_row" ]; then
+        IFS='|' read -r _id nvd_url nvd_score nvd_sev nvd_pub <<< "$enrich_row"
+        if [ -n "$nvd_url" ]; then
+            local score_color="#60a5fa"
+            if [ -n "$nvd_score" ] && [ "$nvd_score" != "null" ] && [ "$nvd_score" != "" ]; then
+                score_val=$(echo "$nvd_score" | cut -d. -f1)
+                if [ "$score_val" -ge 9 ] 2>/dev/null; then score_color="#dc2626"
+                elif [ "$score_val" -ge 7 ] 2>/dev/null; then score_color="#f97316"
+                elif [ "$score_val" -ge 4 ] 2>/dev/null; then score_color="#fbbf24"
+                fi
+            fi
+            echo "<div class=\"detail-section\" style=\"background: #1a2236; border-left: 3px solid #3b82f6; padding: 10px 14px; margin: 6px 0; border-radius: 6px; font-size:0.88em;\">"
+            echo "<div style=\"display:flex; gap:16px; align-items:center; flex-wrap:wrap;\">"
+            echo "<a href=\"$nvd_url\" target=\"_blank\" rel=\"noopener\" style=\"color:#60a5fa; font-weight:600;\">📋 NVD: $cve</a>"
+            if [ -n "$nvd_score" ] && [ "$nvd_score" != "null" ] && [ "$nvd_score" != "" ]; then
+                echo "<span style=\"color:$score_color; font-weight:700;\">CVSS v3: $nvd_score"
+                [ -n "$nvd_sev" ] && [ "$nvd_sev" != "null" ] && echo " ($nvd_sev)"
+                echo "</span>"
+            fi
+            [ -n "$nvd_pub" ] && [ "$nvd_pub" != "null" ] && [ "$nvd_pub" != "" ] && echo "<span style=\"color:#8892a4;\">Published: $nvd_pub</span>"
+            echo "</div></div>"
+        fi
+    fi
+
+    # ── Fix/upgrade recommendation ───────────────────────────────────────────
+    local remediation_data
+    remediation_data=$(get_remediation "$cve" "$pkg")
+    if [ -n "$remediation_data" ]; then
+        IFS='|' read -r _cve _pkg fix_ver cmd <<< "$remediation_data"
+        echo "<div class=\"detail-section\" style=\"background: linear-gradient(135deg, #052e16 0%, #14532d 100%); border-left: 4px solid #10b981; padding: 15px; margin: 10px 0; border-radius: 6px;\">"
+        echo "<h5 style=\"color: #34d399; margin-bottom: 10px;\">💊 Automated Fix Available</h5>"
+        echo "<div style=\"margin: 8px 0;\"><strong style=\"color: #6ee7b7;\">Upgrade to:</strong> <code style=\"background: #14532d; padding: 4px 8px; border-radius: 4px; color: #d1fae5;\">${fix_ver}</code></div>"
+        echo "<div style=\"margin: 8px 0;\"><strong style=\"color: #6ee7b7;\">Command:</strong></div>"
+        echo "<code style=\"display: block; background: #052e16; color: #d1fae5; padding: 10px; border-radius: 4px; font-family: 'Courier New', monospace; font-size: 0.9em; margin: 5px 0;\">${cmd}</code>"
+        echo "<div style=\"margin-top: 10px; padding: 8px; background: #2a1c00; border-radius: 4px; font-size: 0.85em;\">"
+        echo "<strong style=\"color: #fbbf24;\">⚠️ Before applying:</strong> Review changelog, test in dev, run tests, commit lock files"
+        echo "</div>"
+        echo "</div>"
+    fi
+}
+
+# Function to check tool scan status
+# Returns: status (success|failed|skipped), reason
+check_tool_status() {
+    local tool_dir="$1"
+    local status_file="$tool_dir/status.json"
+    
+    if [ -f "$status_file" ] && command -v jq &> /dev/null; then
+        local status=$(jq -r '.status // "unknown"' "$status_file" 2>/dev/null || echo "unknown")
+        local reason=$(jq -r '.reason // ""' "$status_file" 2>/dev/null || echo "")
+        echo "${status}|${reason}"
+    else
+        echo "unknown|"
+    fi
+}
+
+# Function to generate status banner HTML for failed/skipped scans
+generate_status_banner() {
+    local status="$1"
+    local reason="$2"
+    local tool_name="$3"
+    
+    if [ "$status" = "failed" ]; then
+        echo "<div class=\"stats-detail-box\" style=\"background: linear-gradient(135deg, #1a0000 0%, #2d0000 100%); border-left: 4px solid #dc2626; margin-bottom: 15px;\">"
+        echo "<h4 style=\"color: #fca5a5;\">❌ Scan Failed</h4>"
+        echo "<p style=\"color: #fca5a5; margin: 8px 0;\"><strong>Reason:</strong> ${reason:-Unknown error}</p>"
+        echo "<p style=\"color: #fca5a5; font-size: 0.9em;\">The $tool_name scan did not complete successfully. Check the scan logs for details.</p>"
+        echo "</div>"
+    elif [ "$status" = "skipped" ]; then
+        echo "<div class=\"stats-detail-box\" style=\"background: linear-gradient(135deg, #2a1c00 0%, #3d2800 100%); border-left: 4px solid #f59e0b; margin-bottom: 15px;\">"
+        echo "<h4 style=\"color: #fbbf24;\">⏭️ Scan Skipped</h4>"
+        echo "<p style=\"color: #fbbf24; margin: 8px 0;\"><strong>Reason:</strong> ${reason:-Not applicable to this project}</p>"
+        echo "<p style=\"color: #fbbf24; font-size: 0.9em;\">This scan was skipped for this project.</p>"
+        echo "</div>"
+    fi
+}
+
+# ---- TruffleHog Statistics ----
+TH_DIR="${LATEST_SCAN}/trufflehog"
+TH_FILE="$TH_DIR/trufflehog-filesystem-results.json"
+TH_FILES_SCANNED=0
+TH_TOTAL_FINDINGS=0
+TH_VERIFIED=0
+TH_UNVERIFIED=0
+TH_DETECTORS_USED=0
+TH_SCAN_DURATION="N/A"
+TH_FILES_WITH_FINDINGS=0
+TH_CRITICAL=0
+TH_HIGH=0
+TH_MEDIUM=0
+TH_FINDINGS=""
+TH_STATUS="unknown"
+TH_STATUS_REASON=""
+
+# Check tool status first
+if [ -d "$TH_DIR" ]; then
+    IFS='|' read -r TH_STATUS TH_STATUS_REASON <<< "$(check_tool_status "$TH_DIR")"
+fi
+
+if [ -f "$TH_FILE" ]; then
+    # Count only actual findings (lines with DetectorName), not log entries
+    set +o pipefail
+    TH_TOTAL_FINDINGS=$(grep -c '"DetectorName"' "$TH_FILE" 2>/dev/null || true)
+    TH_TOTAL_FINDINGS=$(echo "${TH_TOTAL_FINDINGS:-0}" | tr -d ' \n\t')
+    set -o pipefail
+    [[ "$TH_TOTAL_FINDINGS" =~ ^[0-9]+$ ]] || TH_TOTAL_FINDINGS=0
+    
+    # Count verified secrets
+    set +o pipefail
+    TH_VERIFIED=$(grep '"DetectorName"' "$TH_FILE" 2>/dev/null | grep -c '"Verified":true' 2>/dev/null || true)
+    TH_VERIFIED=$(echo "${TH_VERIFIED:-0}" | tr -d ' \n\t')
+    set -o pipefail
+    TH_VERIFIED=$(echo "$TH_VERIFIED" | tr -d ' \n\t')
+    [[ "$TH_VERIFIED" =~ ^[0-9]+$ ]] || TH_VERIFIED=0
+    
+    TH_UNVERIFIED=$((TH_TOTAL_FINDINGS - TH_VERIFIED))
+    [[ "$TH_UNVERIFIED" =~ ^[0-9]+$ ]] || TH_UNVERIFIED=0
+    
+    set +o pipefail
+    TH_DETECTORS_USED=$(grep -oE '"DetectorName":"[^"]+' "$TH_FILE" 2>/dev/null | sort -u | wc -l | tr -d ' \n\t')
+    set -o pipefail
+    TH_DETECTORS_USED="${TH_DETECTORS_USED:-0}"
+    [[ "$TH_DETECTORS_USED" =~ ^[0-9]+$ ]] || TH_DETECTORS_USED=0
+    
+    set +o pipefail
+    TH_FILES_WITH_FINDINGS=$(grep -oE '"file":"[^"]+' "$TH_FILE" 2>/dev/null | sort -u | wc -l | tr -d ' \n\t')
+    set -o pipefail
+    TH_FILES_WITH_FINDINGS="${TH_FILES_WITH_FINDINGS:-0}"
+    [[ "$TH_FILES_WITH_FINDINGS" =~ ^[0-9]+$ ]] || TH_FILES_WITH_FINDINGS=0
+    
+    # Set severity counts - verified = critical, unverified = medium
+    TH_CRITICAL=$TH_VERIFIED
+    TH_MEDIUM=$TH_UNVERIFIED
+    
+    # Generate findings HTML with clickable details (use set +e to handle grep returning 1 when no matches)
+    set +e
+    TH_FINDINGS_HTML=$(grep -E '"DetectorName"' "$TH_FILE" 2>/dev/null | grep -v 'node_modules' | grep -v 'vendor/' | grep -v 'venv/' | grep -v '__pycache__' | head -n 30 | jq -s -r '
+        map("<div class=\"finding-item severity-" + (if .Verified then "critical" else "medium" end) + "\" data-source=\"app\" onclick=\"toggleFindingDetails(this)\">
+            <div class=\"finding-header\">
+                <span class=\"badge badge-tool\">TruffleHog</span>
+                <span class=\"badge badge-" + (if .Verified then "critical" else "medium" end) + "\">" + (if .Verified then "VERIFIED" else "UNVERIFIED" end) + "</span>
+                <span class=\"badge\" style=\"background:#2C3539;color:#9ca3af;border:1px solid #4a5568;\">" + .DetectorName + "</span>
+                <span class=\"badge\" style=\"background:#152a1f;color:#4ade80;font-size:0.7em;border:1px solid #10b981;\">💻 App Code</span>
+            </div>
+            <div class=\"finding-title\">" + .DetectorName + " - " + (if .Verified then "Verified Secret Found!" else "Potential Secret Detected" end) + "</div>
+            <div class=\"finding-desc\">" + (.DetectorDescription // "Secret or credential pattern detected in source code") + "</div>
+            <div class=\"finding-details\" style=\"display:none;\">
+                <div><strong>Detector:</strong> <code>" + .DetectorName + "</code></div>
+                <div><strong>Source:</strong> 💻 Application Code (secrets in source files)</div>
+                <div><strong>Verified:</strong> " + (if .Verified then "<span style=\"color:#C41E3A;font-weight:bold;\">Yes - Active credential!</span>" else "<span style=\"color:#fb923c;\">No - Potential secret</span>" end) + "</div>
+                <div><strong>File:</strong> <code>" + (.SourceMetadata.Data.Filesystem.file | split("/") | last) + "</code></div>
+                <div><strong>Line:</strong> <code>" + (.SourceMetadata.Data.Filesystem.line | tostring) + "</code></div>
+                <div><strong>Full Path:</strong> <code style=\"font-size: 0.8em;word-break:break-all;\">" + .SourceMetadata.Data.Filesystem.file + "</code></div>
+                <div><strong>Description:</strong> " + (.DetectorDescription // "No description available") + "</div>
+            </div>
+        </div>") | 
+        join("")
+    ' 2>/dev/null || echo "")
+    set -e
+    
+    if [ -n "$TH_FINDINGS_HTML" ] && [ "$TH_FINDINGS_HTML" != "" ]; then
+        TH_FINDINGS="<p style=\"color:#9ca3af;margin-bottom:15px;font-size:0.9em;\">👆 Click on any finding below to expand details</p>${TH_FINDINGS_HTML}"
+    else
+        TH_FINDINGS="<p class=\"no-findings\">✅ No secrets or credentials detected</p>"
+    fi
+else
+    TH_CRITICAL=0
+    TH_HIGH=0
+    TH_MEDIUM=0
+    TH_FINDINGS="<p class=\"no-findings\">No scan data available</p>"
+fi
+
+# ---- ClamAV Statistics ----
+# ClamAV sends per-file results and SCAN SUMMARY to the --log= file (clamav-detailed.log).
+# scan.log (via tee) may only capture stdout without per-file lines.
+CLAMAV_LOG="${LATEST_SCAN}/clamav/clamav-detailed.log"
+[ ! -f "$CLAMAV_LOG" ] && CLAMAV_LOG="${LATEST_SCAN}/clamav/scan.log"
+CLAMAV_FOUND_LOG="$CLAMAV_LOG"
+# Prefer detailed log for FOUND lines
+[ -f "${LATEST_SCAN}/clamav/clamav-detailed.log" ] && CLAMAV_FOUND_LOG="${LATEST_SCAN}/clamav/clamav-detailed.log"
+CLAMAV_FILES_SCANNED=0
+CLAMAV_DATA_SCANNED="0 MB"
+CLAMAV_SCAN_TIME="N/A"
+CLAMAV_ENGINE_VERSION="N/A"
+CLAMAV_VIRUS_DB_COUNT=0
+CLAMAV_INFECTED=0
+CLAMAV_DIRECTORIES=0
+if [ -f "$CLAMAV_LOG" ]; then
+    CLAMAV_FILES_SCANNED=$(grep "Scanned files:" "$CLAMAV_LOG" 2>/dev/null | grep -oE '[0-9]+' | head -1 || echo "0")
+    CLAMAV_DATA_SCANNED=$(grep "Data scanned:" "$CLAMAV_LOG" 2>/dev/null | head -1 | sed 's/Data scanned: //' || echo "N/A")
+    CLAMAV_SCAN_TIME=$(grep "^Time:" "$CLAMAV_LOG" 2>/dev/null | head -1 | sed 's/Time: //' || echo "N/A")
+    CLAMAV_ENGINE_VERSION=$(grep "Engine version:" "$CLAMAV_LOG" 2>/dev/null | head -1 | sed 's/Engine version: //' || echo "N/A")
+    CLAMAV_VIRUS_DB_COUNT=$(grep "Known viruses:" "$CLAMAV_LOG" 2>/dev/null | head -1 | grep -oE '[0-9]+' || echo "0")
+    CLAMAV_INFECTED=$(grep "Infected files:" "$CLAMAV_LOG" 2>/dev/null | head -1 | grep -oE '[0-9]+' || echo "0")
+    CLAMAV_DIRECTORIES=$(grep "Scanned directories:" "$CLAMAV_LOG" 2>/dev/null | head -1 | grep -oE '[0-9]+' || echo "0")
+fi
+CLAMAV_CRITICAL=${CLAMAV_INFECTED:-0}
+if [ "$CLAMAV_CRITICAL" -gt 0 ]; then
+    # Build a virus detections table from the detailed log FOUND lines
+    _clamav_detections_html=""
+    if [ -f "$CLAMAV_FOUND_LOG" ] && grep -q " FOUND$" "$CLAMAV_FOUND_LOG" 2>/dev/null; then
+        _clamav_detections_html="<div style='margin-top:10px;'><strong>🦠 Detected Signatures:</strong><table style='width:100%;margin-top:6px;border-collapse:collapse;font-size:0.85em;'><thead><tr><th style='text-align:left;padding:4px 8px;border-bottom:1px solid #374151;color:#9ca3af;'>Virus / Signature</th><th style='text-align:left;padding:4px 8px;border-bottom:1px solid #374151;color:#9ca3af;'>File</th></tr></thead><tbody>"
+        while IFS= read -r _found_line; do
+            # Format: /path/to/file: VirusName FOUND
+            _rest="${_found_line% FOUND}"
+            _vname="${_rest##*: }"
+            _fpath="${_rest%: ${_vname}}"
+            _clamav_detections_html+="<tr><td style='padding:3px 8px;color:#f87171;font-family:monospace;'>${_vname}</td><td style='padding:3px 8px;color:#d1d5db;font-family:monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:300px;' title='${_fpath}'>$(basename "${_fpath}")</td></tr>"
+        done < <(grep " FOUND$" "$CLAMAV_FOUND_LOG" 2>/dev/null | tr -d '\r')
+        _clamav_detections_html+="</tbody></table></div>"
+    fi
+    CLAMAV_FINDINGS="<div class=\"finding-item severity-critical\" data-source=\"app\">
+        <div class=\"finding-header\">
+            <span class=\"badge badge-tool\">ClamAV</span>
+            <span class=\"badge badge-critical\">CRITICAL</span>
+            <span class=\"badge\" style=\"background:#152a1f;color:#4ade80;font-size:0.7em;border:1px solid #10b981;\">💻 App Code</span>
+        </div>
+        <div class=\"finding-title\">⚠️ Malware Detected</div>
+        <div class=\"finding-desc\">$CLAMAV_CRITICAL infected file(s) found</div>
+        <div class=\"finding-details\">
+            <div><strong>Source:</strong> 💻 Application Code (filesystem scan)</div>
+            <div><strong>Action Required:</strong> Review scan results and quarantine infected files</div>
+            ${_clamav_detections_html}
+        </div>
+    </div>"
+elif [ ! -f "${LATEST_SCAN}/clamav/scan.log" ] && [ ! -f "${LATEST_SCAN}/clamav/clamav-detailed.log" ] && [ "${SCAN_MODE:-full}" = "quick" ]; then
+    CLAMAV_FINDINGS="<div style='padding:20px;text-align:center;background:linear-gradient(135deg,#1a1d23 0%,#2C3539 100%);border:2px solid #6366f1;border-radius:8px;'><p style='color:#818cf8;font-size:1.1em;'>&#x23ED;&#xFE0F; <strong>Not run in quick mode</strong></p><p style='color:#9ca3af;font-size:0.9em;margin-top:8px;'>ClamAV malware scanning is skipped for faster PR scans. Run a full scan (push or scheduled) for complete results.</p></div>"
+else
+    CLAMAV_FINDINGS="<p class=\"no-findings\">✅ No malware detected</p>"
+fi
+
+# ---- Build suppressed CVE/package ID sets for filtering findings tables ----
+# These are populated from IGNORE_CACHE (parsed from .barbatos-ignore.yml).
+# Suppressed findings are hidden from main tool tables and shown in the Suppressed Findings section.
+SUPPRESSED_CVE_IDS_JSON="${SUPPRESSED_CVE_IDS_JSON:-[]}"
+SUPPRESSED_PKG_IDS_JSON="${SUPPRESSED_PKG_IDS_JSON:-[]}"
+if [[ -f "${IGNORE_CACHE:-}" ]]; then
+    _tmp=$(jq '[.ignores[] | select(.type == "cve" and .expired == false) | .value]' "$IGNORE_CACHE" 2>/dev/null) && SUPPRESSED_CVE_IDS_JSON="$_tmp"
+    _tmp=$(jq '[.ignores[] | select(.type == "package" and .expired == false) | .value]' "$IGNORE_CACHE" 2>/dev/null) && SUPPRESSED_PKG_IDS_JSON="$_tmp"
+fi
+
+# Initialize suppressed findings log if it was not already written by check-severity-gate.sh
+# (happens on local runs where the gate script is not called separately).
+if declare -f init_suppressed_log >/dev/null 2>&1 && [[ -n "${SUPPRESSED_LOG:-}" ]] && [[ ! -f "$SUPPRESSED_LOG" ]]; then
+    init_suppressed_log || true
+fi
+
+# ---- Trivy Statistics ----
+TRIVY_DIR="${LATEST_SCAN}/trivy"
+TRIVY_IMAGES_SCANNED=0
+TRIVY_TOTAL_VULNS=0
+TRIVY_CRITICAL=0
+TRIVY_HIGH=0
+TRIVY_MEDIUM=0
+TRIVY_LOW=0
+TRIVY_FINDINGS=""
+TRIVY_DETAILS=""
+if [ -d "$TRIVY_DIR" ]; then
+    TRIVY_IMAGES_SCANNED=$(find "$TRIVY_DIR" -name "*.json" -type f ! -type l 2>/dev/null | wc -l | tr -d ' \n' || echo "0")
+    [[ "$TRIVY_IMAGES_SCANNED" =~ ^[0-9]+$ ]] || TRIVY_IMAGES_SCANNED=0
+    
+    # Parse vulnerabilities from all Trivy JSON files
+    for trivy_file in "$TRIVY_DIR"/*.json; do
+        # Skip symlinks to avoid duplicate counting
+        if [ -f "$trivy_file" ] && [ ! -L "$trivy_file" ] && grep -q '"SchemaVersion"' "$trivy_file" 2>/dev/null; then
+            # Extract JSON portion (skip any log lines at the beginning)
+            set +o pipefail
+            json_content=$(sed -n '/^{/,$p' "$trivy_file" 2>/dev/null || cat "$trivy_file")
+            set -o pipefail
+            
+            crit_count=$(echo "$json_content" | jq --argjson sc "$SUPPRESSED_CVE_IDS_JSON" '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL") | select(.VulnerabilityID as $v | $sc | index($v) == null)] | length' 2>/dev/null || echo "0")
+            high_count=$(echo "$json_content" | jq --argjson sc "$SUPPRESSED_CVE_IDS_JSON" '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH") | select(.VulnerabilityID as $v | $sc | index($v) == null)] | length' 2>/dev/null || echo "0")
+            med_count=$(echo "$json_content" | jq --argjson sc "$SUPPRESSED_CVE_IDS_JSON" '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM") | select(.VulnerabilityID as $v | $sc | index($v) == null)] | length' 2>/dev/null || echo "0")
+            low_count=$(echo "$json_content" | jq --argjson sc "$SUPPRESSED_CVE_IDS_JSON" '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW") | select(.VulnerabilityID as $v | $sc | index($v) == null)] | length' 2>/dev/null || echo "0")
+            
+            # Ensure numeric
+            [[ "$crit_count" =~ ^[0-9]+$ ]] || crit_count=0
+            [[ "$high_count" =~ ^[0-9]+$ ]] || high_count=0
+            [[ "$med_count" =~ ^[0-9]+$ ]] || med_count=0
+            [[ "$low_count" =~ ^[0-9]+$ ]] || low_count=0
+            
+            TRIVY_CRITICAL=$((TRIVY_CRITICAL + crit_count))
+            TRIVY_HIGH=$((TRIVY_HIGH + high_count))
+            TRIVY_MEDIUM=$((TRIVY_MEDIUM + med_count))
+            TRIVY_LOW=$((TRIVY_LOW + low_count))
+            
+            # Extract individual vulnerability details for ALL severity levels (limit to top 50 per file)
+            set +e
+            vuln_details=$(echo "$json_content" | jq -r --argjson suppressed_cves "$SUPPRESSED_CVE_IDS_JSON" '
+                def html_escape: gsub("<"; "&lt;") | gsub(">"; "&gt;") | gsub("\""; "&quot;") | gsub("\n"; " ");
+                def status_badge_color: if . == "fixed" then "#c6f6d5;color:#2f855a" elif . == "affected" then "#fed7d7;color:#c53030" else "#feebc8;color:#c05621" end;
+                def status_text_color: if . == "fixed" then "#2f855a" elif . == "affected" then "#c53030" else "#c05621" end;
+                def fixed_color: if . == "No fix available" then "color:#c53030;" else "color:#2f855a;" end;
+                def format_date: if . == "Unknown" then "Unknown" else (. | split("T")[0]) end;
+                def cwes_display: if . == "" then "Not specified" else . end;
+                [.Results[]? | select(.Vulnerabilities != null) | 
+                 .Target as $target |
+                 .Type as $pkg_type |
+                 (.Class // "unknown") as $result_class |
+                 (.OS | if . then ((.Family // "") + (if .Name then " " + .Name else "" end)) else "" end) as $os_info |
+                 .Vulnerabilities[]? | 
+                 select(.VulnerabilityID as $v | $suppressed_cves | index($v) == null) |
+                 {target: $target, 
+                  pkg_type: $pkg_type,
+                  id: .VulnerabilityID, 
+                  pkg: .PkgName, 
+                  severity: .Severity, 
+                  severity_lc: (.Severity | ascii_downcase),
+                  installed: .InstalledVersion, 
+                  fixed: (.FixedVersion // "No fix available"),
+                  status: (.Status // "unknown"),
+                  status_uc: ((.Status // "unknown") | ascii_upcase),
+                  status_badge: ((.Status // "unknown") | status_badge_color),
+                  status_color: ((.Status // "unknown") | status_text_color),
+                  fixed_style: ((.FixedVersion // "No fix available") | fixed_color),
+                  title: ((.Title // .VulnerabilityID) | html_escape | .[0:80]), 
+                  desc: ((.Description // "No description available") | html_escape),
+                  desc_short: ((.Description // "No description available") | html_escape | .[0:120]),
+                  primary_url: (.PrimaryURL // ""),
+                  published: ((.PublishedDate // "Unknown") | format_date),
+                  modified: ((.LastModifiedDate // "Unknown") | format_date),
+                  cwes: (((.CweIDs // []) | join(", ")) | cwes_display),
+                  refs: ((.References // []) | .[0:3] | join(" ")),
+                  data_source: (.DataSource.Name // "Unknown"),
+                  purl: ((.PkgIdentifier.PURL // "") | html_escape),
+                  sev_source: (.SeveritySource // ""),
+                  vendor_sev: ((.VendorSeverity // {}) | to_entries | map(.key + ":" + (if (.value | type) == "number" then if .value == 4 then "CRITICAL" elif .value == 3 then "HIGH" elif .value == 2 then "MEDIUM" elif .value == 1 then "LOW" else "UNKNOWN" end elif (.value | type) == "string" then .value else "UNKNOWN" end)) | join(", ")),
+                  cvss_v3_score: (((.CVSS // {}) | to_entries | map(select(.value.V3Score != null)) | sort_by(if .key == "nvd" then 0 else 1 end) | if length > 0 then .[0] else null end) | if . then (.value.V3Score | tostring) + " (" + .key + ")" else "N/A" end),
+                  cvss_v3_color: (((.CVSS // {}) | to_entries | map(select(.value.V3Score != null)) | sort_by(if .key == "nvd" then 0 else 1 end) | if length > 0 then .[0] else null end) | if . then (.value.V3Score | if . >= 9.0 then "#fc8181" elif . >= 7.0 then "#f6ad55" elif . >= 4.0 then "#fbd38d" else "#68d391" end) else "#9ca3af" end),
+                  cvss_v3_vec: (((.CVSS // {}) | to_entries | map(select(.value.V3Vector != null)) | sort_by(if .key == "nvd" then 0 else 1 end) | if length > 0 then .[0] else null end) | if . then .value.V3Vector else "" end),
+                  layer_diffid: (.Layer.DiffID // ""),
+                  layer_digest: (.Layer.Digest // ""),
+                  pkg_path: (.PkgPath // ""),
+                  result_class: $result_class,
+                  os_info: $os_info,
+                  source_type: (if ($target | test("(bitnami|node|python|alpine|ubuntu|debian|nginx|redis|postgres|mysql|mongo|openjdk)"; "i")) or ($target | test("\\(.*\\)$")) or (.PkgType // "" | test("(debian|ubuntu|alpine|rhel|centos|fedora|os-pkgs|photon)"; "i")) then "image" else "app" end)}
+                ] | sort_by(.severity | if . == "CRITICAL" then 0 elif . == "HIGH" then 1 elif . == "MEDIUM" then 2 else 3 end) | .[0:50] | .[] |
+                "<div class=\"finding-item severity-" + .severity_lc + "\" data-pkg=\"" + .pkg + "\" data-status=\"" + .status + "\" data-cve=\"" + .id + "\" data-source=\"" + .source_type + "\" onclick=\"toggleFindingDetails(this)\">\n<div class=\"finding-header\">\n<span class=\"badge badge-tool\">Trivy</span>\n<span class=\"badge badge-" + .severity_lc + "\">" + .severity + "</span>\n<span class=\"badge\" style=\"background:#2C3539;color:#9ca3af;border:1px solid #4a5568;\">" + .id + "</span>\n<span class=\"badge\" style=\"background:" + .status_badge + ";\">" + .status_uc + "</span>\n<span class=\"badge\" style=\"background:" + (if .source_type == "image" then "#1a2a3a;border:1px solid #3b82f6;color:#60a5fa" else "#152a1f;border:1px solid #10b981;color:#4ade80" end) + ";font-size:0.7em;\">" + (if .source_type == "image" then "📦 Container Image" else "💻 App Code" end) + "</span>" + (if .cvss_v3_score != "N/A" then "\n<span class=\"badge\" style=\"background:#1a2b3c;color:" + .cvss_v3_color + ";border:1px solid #3b82f6;\">CVSS " + .cvss_v3_score + "</span>" else "" end) + "\n</div>
+<div class=\"finding-title\">" + .pkg + "@" + .installed + " - " + .title + "</div>
+<div class=\"finding-desc\">" + .desc_short + "...</div>
+<div class=\"finding-details\" style=\"display:none;\">
+<div class=\"detail-section\"><h5>Vulnerability Info</h5>
+<div><strong>CVE ID:</strong> <code>" + .id + "</code> <a href=\"" + .primary_url + "\" target=\"_blank\" style=\"color:#C41E3A;\">View Details</a></div>
+<div><strong>CWE IDs:</strong> <code>" + .cwes + "</code></div>
+<div><strong>Data Source:</strong> " + .data_source + "</div>
+<div><strong>Published:</strong> " + .published + "</div>
+<div><strong>Last Modified:</strong> " + .modified + "</div>
+</div>
+<div class=\"detail-section\"><h5>Package Info</h5>
+<div><strong>Package:</strong> <code>" + .pkg + "</code></div>
+<div><strong>Type:</strong> <code>" + .pkg_type + "</code></div>
+<div><strong>Installed:</strong> <code>" + .installed + "</code></div>
+<div><strong>Fixed Version:</strong> <code style=\"" + .fixed_style + "\">" + .fixed + "</code></div>
+<div><strong>Status:</strong> <span style=\"font-weight:600;color:" + .status_color + ";\">" + .status_uc + "</span></div>
+<div><strong>PURL:</strong> <code style=\"font-size:0.8em;word-break:break-all;\">" + .purl + "</code></div>
+</div>
+<div class=\"detail-section\"><h5>CVSS &amp; Scan Details</h5>
+<div><strong>CVSS v3:</strong> <span style=\"font-weight:700;color:" + .cvss_v3_color + ";\">" + .cvss_v3_score + "</span>" + (if .cvss_v3_vec != "" then " <code style=\"font-size:0.75em;color:#9ca3af;\">" + .cvss_v3_vec + "</code>" else "" end) + "</div>
+" + (if .sev_source != "" then "<div><strong>Severity Source:</strong> <code>" + .sev_source + "</code></div>\n" else "" end) + (if .vendor_sev != "" then "<div><strong>Vendor Severities:</strong> <code style=\"font-size:0.85em;\">" + .vendor_sev + "</code></div>\n" else "" end) + (if .os_info != "" then "<div><strong>OS:</strong> <code>" + .os_info + "</code></div>\n" else "" end) + "<div><strong>Result Class:</strong> <code>" + .result_class + "</code></div>
+" + (if .pkg_path != "" then "<div><strong>Package Path:</strong> <code style=\"font-size:0.8em;word-break:break-all;\">" + .pkg_path + "</code></div>\n" else "" end) + (if .layer_diffid != "" then "<div><strong>Layer DiffID:</strong> <code style=\"font-size:0.78em;word-break:break-all;\">" + .layer_diffid + "</code></div>\n" else "" end) + (if .layer_digest != "" then "<div><strong>Layer Digest:</strong> <code style=\"font-size:0.78em;word-break:break-all;\">" + .layer_digest + "</code></div>\n" else "" end) + "</div>
+<!--REMEDIATION_MARKER:" + .id + ":" + .pkg + "-->
+<div class=\"detail-section\"><h5>False Positive Assessment</h5>
+<div class=\"fp-checklist\">
+<label><input type=\"checkbox\" class=\"fp-check\"> Package not used in production</label>
+<label><input type=\"checkbox\" class=\"fp-check\"> Vulnerable code path not reachable</label>
+<label><input type=\"checkbox\" class=\"fp-check\"> Compensating controls in place</label>
+<label><input type=\"checkbox\" class=\"fp-check\"> Risk accepted per security policy</label>
+</div>
+<div style=\"margin-top:10px;\"><strong>Target:</strong> <code>" + .target + "</code></div>
+</div>
+<div class=\"detail-section\"><h5>Description</h5>
+<div style=\"background:#1e2530;color:#d1d5db;padding:12px;border-radius:6px;font-size:0.9em;line-height:1.6;border:1px solid #374151;\">" + .desc + "</div>
+</div>
+</div>
+</div>"
+            ' 2>/dev/null)
+            set -e
+            
+            if [ -n "$vuln_details" ]; then
+                # Process remediation markers
+                processed_details=""
+                while IFS= read -r line; do
+                    if [[ "$line" =~ \<!--REMEDIATION_MARKER:([^:]+):([^-]+)--\> ]]; then
+                        cve="${BASH_REMATCH[1]}"
+                        pkg="${BASH_REMATCH[2]}"
+                        processed_details="${processed_details}$(inject_remediation "$cve" "$pkg")
+"
+                    else
+                        processed_details="${processed_details}${line}
+"
+                    fi
+                done <<< "$vuln_details"
+                
+                TRIVY_DETAILS="${TRIVY_DETAILS}${processed_details}"
+            fi
+        fi
+    done
+    TRIVY_TOTAL_VULNS=$((TRIVY_CRITICAL + TRIVY_HIGH + TRIVY_MEDIUM + TRIVY_LOW))
+
+    # Log suppressed Trivy findings to suppressed-findings.md (so they appear in Suppressed section)
+    if declare -f log_suppressed >/dev/null 2>&1 && [[ -f "${IGNORE_CACHE:-}" ]] && \
+       [[ "$(echo "$SUPPRESSED_CVE_IDS_JSON" | jq 'length' 2>/dev/null || echo 0)" -gt 0 ]]; then
+        for trivy_file in "$TRIVY_DIR"/*.json; do
+            if [ -f "$trivy_file" ] && [ ! -L "$trivy_file" ] && grep -q '"SchemaVersion"' "$trivy_file" 2>/dev/null; then
+                set +o pipefail
+                _jc=$(sed -n '/^{/,$p' "$trivy_file" 2>/dev/null || cat "$trivy_file")
+                set -o pipefail
+                while IFS='|' read -r _cve _sev _pkg; do
+                    [[ -z "$_cve" ]] && continue
+                    _reason=$(jq -r --arg v "$_cve" '.ignores[] | select(.type=="cve" and .value==$v) | .reason' "$IGNORE_CACHE" 2>/dev/null | head -1)
+                    _approved=$(jq -r --arg v "$_cve" '.ignores[] | select(.type=="cve" and .value==$v) | .approved_by // "Not specified"' "$IGNORE_CACHE" 2>/dev/null | head -1)
+                    log_suppressed "Trivy" "cve" "$_cve" "${_reason:-Not provided}" "$_sev" "${_approved:-Not specified}" || true
+                done < <(echo "$_jc" | jq -r --argjson sc "$SUPPRESSED_CVE_IDS_JSON" \
+                    '.Results[]?.Vulnerabilities[]? | select(.VulnerabilityID as $v | $sc | index($v) != null) | [.VulnerabilityID, .Severity, .PkgName] | @tsv' \
+                    2>/dev/null | tr '\t' '|')
+            fi
+        done
+    fi
+    
+    if [ "$TRIVY_TOTAL_VULNS" -gt 0 ]; then
+        TRIVY_FINDINGS="<div class=\"finding-summary\">
+            <span class=\"badge badge-critical\">$TRIVY_CRITICAL Critical</span>
+            <span class=\"badge badge-high\">$TRIVY_HIGH High</span>
+            <span class=\"badge badge-medium\">$TRIVY_MEDIUM Medium</span>
+            <span class=\"badge badge-low\">$TRIVY_LOW Low</span>
+        </div>
+        <div class=\"trivy-controls\" style=\"margin-bottom:20px;\">
+            <div style=\"display:flex;gap:10px;flex-wrap:wrap;align-items:center;\">
+                <span style=\"font-weight:600;color:#4a5568;\">Filter by Status:</span>
+                <button class=\"filter-chip filter-chip-all active\" onclick=\"filterTrivyByStatus('all')\">All</button>
+                <button class=\"filter-chip\" style=\"background:#c6f6d5;color:#2f855a;\" onclick=\"filterTrivyByStatus('fixed')\">🔧 Has Fix</button>
+                <button class=\"filter-chip\" style=\"background:#fed7d7;color:#c53030;\" onclick=\"filterTrivyByStatus('affected')\">⚠️ No Fix</button>
+            </div>
+            <div style=\"margin-top:10px;\">
+                <input type=\"text\" id=\"trivy-search\" placeholder=\"🔍 Search by CVE, package name, or description...\" 
+                    onkeyup=\"filterTrivyBySearch(this.value)\" 
+                    style=\"width:100%;padding:10px 15px;border:2px solid #e2e8f0;border-radius:8px;font-size:0.95em;\">
+            </div>
+        </div>
+        <p style=\"color:#718096;margin-bottom:15px;font-size:0.9em;\">💡 Click any finding to expand details. Green \"FIXED\" status means a patched version is available.</p>
+        ${TRIVY_DETAILS}"
+    else
+        TRIVY_FINDINGS="<p class=\"no-findings\">✅ No vulnerabilities detected in container images</p>"
+    fi
+else
+    TRIVY_FINDINGS="<p class=\"no-findings\">No Trivy scan data available</p>"
+fi
+
+# ---- Grype Statistics ----
+GRYPE_DIR="${LATEST_SCAN}/grype"
+GRYPE_TARGETS_SCANNED=0
+GRYPE_TOTAL_VULNS=0
+GRYPE_CRITICAL=0
+GRYPE_HIGH=0
+GRYPE_MEDIUM=0
+GRYPE_LOW=0
+GRYPE_FINDINGS=""
+GRYPE_DETAILS=""
+if [ -d "$GRYPE_DIR" ]; then
+    GRYPE_TARGETS_SCANNED=$(find "$GRYPE_DIR" -name "*.json" -type f ! -name "*.log" 2>/dev/null | wc -l | tr -d ' \n' || echo "0")
+    [[ "$GRYPE_TARGETS_SCANNED" =~ ^[0-9]+$ ]] || GRYPE_TARGETS_SCANNED=0
+    
+    for grype_file in "$GRYPE_DIR"/*.json; do
+        # Skip symlinks to avoid double counting
+        if [ -f "$grype_file" ] && [ ! -L "$grype_file" ]; then
+            crit_count=$(jq --argjson sc "$SUPPRESSED_CVE_IDS_JSON" '[.matches[]? | select(.vulnerability.severity=="Critical") | select(.vulnerability.id as $v | $sc | index($v) == null)] | length' "$grype_file" 2>/dev/null || echo "0")
+            high_count=$(jq --argjson sc "$SUPPRESSED_CVE_IDS_JSON" '[.matches[]? | select(.vulnerability.severity=="High") | select(.vulnerability.id as $v | $sc | index($v) == null)] | length' "$grype_file" 2>/dev/null || echo "0")
+            med_count=$(jq --argjson sc "$SUPPRESSED_CVE_IDS_JSON" '[.matches[]? | select(.vulnerability.severity=="Medium") | select(.vulnerability.id as $v | $sc | index($v) == null)] | length' "$grype_file" 2>/dev/null || echo "0")
+            low_count=$(jq --argjson sc "$SUPPRESSED_CVE_IDS_JSON" '[.matches[]? | select(.vulnerability.severity=="Low") | select(.vulnerability.id as $v | $sc | index($v) == null)] | length' "$grype_file" 2>/dev/null || echo "0")
+            
+            # Ensure numeric
+            [[ "$crit_count" =~ ^[0-9]+$ ]] || crit_count=0
+            [[ "$high_count" =~ ^[0-9]+$ ]] || high_count=0
+            [[ "$med_count" =~ ^[0-9]+$ ]] || med_count=0
+            [[ "$low_count" =~ ^[0-9]+$ ]] || low_count=0
+            
+            GRYPE_CRITICAL=$((GRYPE_CRITICAL + crit_count))
+            GRYPE_HIGH=$((GRYPE_HIGH + high_count))
+            GRYPE_MEDIUM=$((GRYPE_MEDIUM + med_count))
+            GRYPE_LOW=$((GRYPE_LOW + low_count))
+            
+            # Extract individual vulnerability details for ALL severity levels (limit to top 50 per file)
+            set +e
+            vuln_details=$(jq -r --argjson suppressed_cves "$SUPPRESSED_CVE_IDS_JSON" '
+                (.source.type // "unknown") as $scan_type |
+                [.matches[]? |
+                 select(.vulnerability.id as $v | $suppressed_cves | index($v) == null) |
+                 (([.vulnerability.cvss[]? | select(.version | startswith("3"))] | first) // null) as $cvss3 |
+                 (([.vulnerability.cvss[]? | select(.version | startswith("2"))] | first) // null) as $cvss2 |
+                 {id: .vulnerability.id,
+                  pkg: .artifact.name,
+                  version: .artifact.version,
+                  severity: .vulnerability.severity,
+                  fixed: (.vulnerability.fix.versions[0] // "Not fixed"),
+                  fix_state: (.vulnerability.fix.state // "unknown"),
+                  desc: (.vulnerability.description // "No description available"),
+                  pkg_type: (.artifact.type // "unknown"),
+                  language: (.artifact.language // ""),
+                  locations: ((.artifact.locations // []) | map(.path // .realPath // "") | map(select(. != "")) | .[0:5] | join(" | ")),
+                  licenses: ((.artifact.licenses // []) | join(", ")),
+                  cpes: ((.artifact.cpes // []) | .[0:2] | join(", ")),
+                  purl: (.artifact.purl // ""),
+                  matcher: (.matchDetails[0].matcher // "unknown"),
+                  match_constraint: (.matchDetails[0].found.versionConstraint // ""),
+                  cvss_v3_score: (if $cvss3 then ($cvss3.metrics.baseScore | tostring) else "N/A" end),
+                  cvss_v3_color: (if $cvss3 then ($cvss3.metrics.baseScore | if . >= 9.0 then "#fc8181" elif . >= 7.0 then "#f6ad55" elif . >= 4.0 then "#fbd38d" else "#68d391" end) else "#9ca3af" end),
+                  cvss_v3_vec: (if $cvss3 then ($cvss3.vector // "") else "" end),
+                  cvss_v2_score: (if $cvss2 then ($cvss2.metrics.baseScore | tostring) else "N/A" end),
+                  related: ((.vulnerability.relatedVulnerabilities // []) | map(.id) | .[0:5] | join(", ")),
+                  vuln_url1: ((.vulnerability.urls // []) | .[0] // ""),
+                  source_type: (if $scan_type == "image" then "image" elif (.artifact.type // "" | test("(deb|apk|rpm|alpm|portage|photon)"; "i")) then "image" else "app" end)}
+                ] | sort_by(.severity | if . == "Critical" then 0 elif . == "High" then 1 elif . == "Medium" then 2 else 3 end) | .[0:50] | .[] |
+                "<div class=\"finding-item severity-\(.severity | ascii_downcase)\" data-source=\"\(.source_type)\" onclick=\"toggleFindingDetails(this)\">
+                    <div class=\"finding-header\">
+                        <span class=\"badge badge-tool\">Grype</span>
+                        <span class=\"badge badge-\(.severity | ascii_downcase)\">\(.severity)</span>
+                        <span class=\"badge\" style=\"background:#2C3539;color:#9ca3af;border:1px solid #4a5568;\">\(.id)</span>
+                        \(if .cvss_v3_score != "N/A" then "<span class=\"badge\" style=\"background:#1a2b3c;color:\(.cvss_v3_color);border:1px solid #3b82f6;\">CVSS \(.cvss_v3_score)</span>" else "" end)
+                        <span class=\"badge\" style=\"background:\(if .source_type == "image" then "#1a2a3a;border:1px solid #3b82f6;color:#60a5fa" else "#152a1f;border:1px solid #10b981;color:#4ade80" end);font-size:0.7em;\">\(if .source_type == "image" then "📦 Container Image" else "💻 App Code" end)</span>
+                    </div>
+                    <div class=\"finding-title\">\(.pkg)@\(.version)</div>
+                    <div class=\"finding-desc\">\(.desc | .[0:200])...</div>
+                    <div class=\"finding-details\" style=\"display:none;\">
+                        <div class=\"detail-section\"><h5>Vulnerability Info</h5>
+                        \(if .vuln_url1 != "" then "<div><strong>CVE ID:</strong> <code>\(.id)</code> <a href=\"\(.vuln_url1)\" target=\"_blank\" style=\"color:#C41E3A;\">View Details</a></div>" else "<div><strong>CVE ID:</strong> <code>\(.id)</code></div>" end)
+                        <div><strong>CVSS v3:</strong> <span style=\"font-weight:700;color:\(.cvss_v3_color);\">\(.cvss_v3_score)</span>\(if .cvss_v3_vec != "" then " <code style=\"font-size:0.75em;color:#9ca3af;\">\(.cvss_v3_vec)</code>" else "" end)</div>
+                        <div><strong>CVSS v2:</strong> \(.cvss_v2_score)</div>
+                        <div><strong>Fix State:</strong> <span style=\"font-weight:600;color:\(if .fix_state == "fixed" then "#2f855a" elif .fix_state == "wont-fix" then "#c53030" else "#c05621" end);\">\(.fix_state | ascii_upcase)</span></div>
+                        \(if .related != "" then "<div><strong>Related CVEs:</strong> <code style=\"font-size:0.85em;\">\(.related)</code></div>" else "" end)
+                        </div>
+                        <div class=\"detail-section\"><h5>Package Info</h5>
+                        <div><strong>Package:</strong> <code>\(.pkg)</code>\(if .language != "" then " <em>(\(.language))</em>" else "" end)</div>
+                        <div><strong>Type:</strong> <code>\(.pkg_type)</code></div>
+                        <div><strong>Source:</strong> \(if .source_type == "image" then "📦 Container Image (bundled in base image)" else "💻 Application Code" end)</div>
+                        <div><strong>Installed:</strong> <code>\(.version)</code></div>
+                        <div><strong>Fixed Version:</strong> <code>\(.fixed)</code></div>
+                        <div><strong>Matcher:</strong> <code style=\"font-size:0.85em;\">\(.matcher)</code></div>
+                        \(if .match_constraint != "" then "<div><strong>Match Constraint:</strong> <code style=\"font-size:0.85em;\">\(.match_constraint)</code></div>" else "" end)
+                        \(if .locations != "" then "<div><strong>Location(s):</strong> <code style=\"font-size:0.8em;word-break:break-all;\">\(.locations)</code></div>" else "" end)
+                        \(if .licenses != "" then "<div><strong>License(s):</strong> <code>\(.licenses)</code></div>" else "" end)
+                        \(if .cpes != "" then "<div><strong>CPE(s):</strong> <code style=\"font-size:0.78em;word-break:break-all;\">\(.cpes)</code></div>" else "" end)
+                        \(if .purl != "" then "<div><strong>PURL:</strong> <code style=\"font-size:0.78em;word-break:break-all;\">\(.purl)</code></div>" else "" end)
+                        </div>
+                        <!--REMEDIATION_MARKER:\(.id):\(.pkg)-->
+                        <div class=\"detail-section\"><h5>False Positive Assessment</h5>
+                        <div class=\"fp-checklist\">
+                        <label><input type=\"checkbox\" class=\"fp-check\"> Package not used in production</label>
+                        <label><input type=\"checkbox\" class=\"fp-check\"> Vulnerable code path not reachable</label>
+                        <label><input type=\"checkbox\" class=\"fp-check\"> Compensating controls in place</label>
+                        <label><input type=\"checkbox\" class=\"fp-check\"> Risk accepted per security policy</label>
+                        </div></div>
+                        <div class=\"detail-section\"><h5>Description</h5>
+                        <div style=\"background:#1e2530;color:#d1d5db;padding:12px;border-radius:6px;font-size:0.9em;line-height:1.6;border:1px solid #374151;\">\(.desc)</div>
+                        </div>
+                    </div>
+                </div>"
+            ' "$grype_file" 2>/dev/null)
+            set -e
+            
+            if [ -n "$vuln_details" ]; then
+                # Process remediation markers
+                processed_details=""
+                while IFS= read -r line; do
+                    if [[ "$line" =~ \<!--REMEDIATION_MARKER:([^:]+):([^-]+)--\> ]]; then
+                        cve="${BASH_REMATCH[1]}"
+                        pkg="${BASH_REMATCH[2]}"
+                        remediation_html=$(inject_remediation "$cve" "$pkg")
+                        processed_details+="$remediation_html
+"
+                    else
+                        processed_details+="$line
+"
+                    fi
+                done <<< "$vuln_details"
+                
+                GRYPE_DETAILS="${GRYPE_DETAILS}${processed_details}"
+            fi
+        fi
+    done
+    GRYPE_TOTAL_VULNS=$((GRYPE_CRITICAL + GRYPE_HIGH + GRYPE_MEDIUM + GRYPE_LOW))
+
+    # Log suppressed Grype findings to suppressed-findings.md
+    if declare -f log_suppressed >/dev/null 2>&1 && [[ -f "${IGNORE_CACHE:-}" ]] && \
+       [[ "$(echo "$SUPPRESSED_CVE_IDS_JSON" | jq 'length' 2>/dev/null || echo 0)" -gt 0 ]]; then
+        for grype_file in "$GRYPE_DIR"/*.json; do
+            if [ -f "$grype_file" ] && [ ! -L "$grype_file" ]; then
+                while IFS='|' read -r _cve _sev _pkg; do
+                    [[ -z "$_cve" ]] && continue
+                    _reason=$(jq -r --arg v "$_cve" '.ignores[] | select(.type=="cve" and .value==$v) | .reason' "$IGNORE_CACHE" 2>/dev/null | head -1)
+                    _approved=$(jq -r --arg v "$_cve" '.ignores[] | select(.type=="cve" and .value==$v) | .approved_by // "Not specified"' "$IGNORE_CACHE" 2>/dev/null | head -1)
+                    log_suppressed "Grype" "cve" "$_cve" "${_reason:-Not provided}" "$_sev" "${_approved:-Not specified}" || true
+                done < <(jq -r --argjson sc "$SUPPRESSED_CVE_IDS_JSON" \
+                    '.matches[]? | select(.vulnerability.id as $v | $sc | index($v) != null) | [.vulnerability.id, .vulnerability.severity, .artifact.name] | @tsv' \
+                    "$grype_file" 2>/dev/null | tr '\t' '|')
+            fi
+        done
+    fi
+    
+    if [ "$GRYPE_TOTAL_VULNS" -gt 0 ]; then
+        GRYPE_FINDINGS="<div class=\"finding-summary\">
+            <span class=\"badge badge-critical\">$GRYPE_CRITICAL Critical</span>
+            <span class=\"badge badge-high\">$GRYPE_HIGH High</span>
+            <span class=\"badge badge-medium\">$GRYPE_MEDIUM Medium</span>
+            <span class=\"badge badge-low\">$GRYPE_LOW Low</span>
+        </div>
+        <p style=\"color:#718096;margin-bottom:15px;font-size:0.9em;\">👆 Click on any finding below to expand details (showing up to 50 per target)</p>
+        ${GRYPE_DETAILS}"
+    else
+        GRYPE_FINDINGS="<p class=\"no-findings\">✅ No vulnerabilities detected</p>"
+    fi
+else
+    GRYPE_FINDINGS="<p class=\"no-findings\">No Grype scan data available</p>"
+fi
+
+# ---- SBOM Statistics ----
+SBOM_DIR="${LATEST_SCAN}/sbom"
+SBOM_PACKAGES=0
+SBOM_FILES_GENERATED=0
+SBOM_PACKAGE_TYPES=""
+SBOM_FINDINGS=""
+if [ -d "$SBOM_DIR" ]; then
+    SBOM_FILES_GENERATED=$(find "$SBOM_DIR" -name "*.json" -type f 2>/dev/null | wc -l | tr -d ' \n' || echo "0")
+    [[ "$SBOM_FILES_GENERATED" =~ ^[0-9]+$ ]] || SBOM_FILES_GENERATED=0
+    
+    # Build hash lookup (name → status) for per-package enrichment
+    _HASH_BY_NAME='{}'
+    if [[ -f "$HASH_VERIFY_FILE" ]]; then
+        _HASH_BY_NAME=$(jq 'reduce (.results // [])[] as $r ({}; .[$r.name] = $r.status)' "$HASH_VERIFY_FILE" 2>/dev/null || echo '{}')
+    fi
+
+    # Build VEX lookup (name@version → [CVEs]) for per-package enrichment
+    _VEX_BY_PKG='{}'
+    if [[ -f "${LATEST_SCAN}/grype/vex-summary.json" ]]; then
+        _VEX_BY_PKG=$(jq 'reduce (.statements // [])[] as $s ({}; .[$s.package + "@" + ($s.version // "")] += [$s.cve])' \
+            "${LATEST_SCAN}/grype/vex-summary.json" 2>/dev/null || echo '{}')
+    fi
+
+    # Prefer CycloneDX file (components[]) — fall back to syft-json (artifacts[])
+    _BEST_SBOM_FILE=""
+    _BEST_SBOM_COUNT=0
+    _SBOM_FORMAT=""
+    # Check CycloneDX files first
+    for sbom_file in "$SBOM_DIR"/*.cyclonedx.json; do
+        [ -f "$sbom_file" ] || continue
+        c=$(jq '(.components // []) | length' "$sbom_file" 2>/dev/null || echo "0")
+        [[ "$c" =~ ^[0-9]+$ ]] || c=0
+        if [ "$c" -gt "$_BEST_SBOM_COUNT" ]; then
+            _BEST_SBOM_COUNT=$c; _BEST_SBOM_FILE="$sbom_file"; _SBOM_FORMAT="cyclonedx"
+        fi
+    done
+    # Fall back to syft-json if no CycloneDX
+    if [ "$_BEST_SBOM_COUNT" -eq 0 ]; then
+        for sbom_file in "$SBOM_DIR"/*.json; do
+            [ -f "$sbom_file" ] || continue
+            c=$(jq '(.artifacts // []) | length' "$sbom_file" 2>/dev/null || echo "0")
+            [[ "$c" =~ ^[0-9]+$ ]] || c=0
+            if [ "$c" -gt "$_BEST_SBOM_COUNT" ]; then
+                _BEST_SBOM_COUNT=$c; _BEST_SBOM_FILE="$sbom_file"; _SBOM_FORMAT="syft"
+            fi
+        done
+    fi
+    SBOM_PACKAGES=$_BEST_SBOM_COUNT
+
+    # Generate SBOM findings HTML with package details
+    if [ "$SBOM_PACKAGES" -gt 0 ] && [ -n "$_BEST_SBOM_FILE" ]; then
+        if [ "$_SBOM_FORMAT" = "cyclonedx" ]; then
+            SBOM_TYPE_BREAKDOWN=$(jq -r '
+                [.components[]? | .type // "library"] |
+                group_by(.) | map({type: .[0], count: length}) | sort_by(-.count) | .[:15] |
+                map("<button class=\"sbom-filter-chip\" data-type=\"\(.type)\" onclick=\"filterSBOMByType(this, '"'"'\(.type)'"'"')\"><span class=\"type-name\">\(.type)</span><span class=\"type-count\">\(.count)</span></button>") |
+                join("")' "$_BEST_SBOM_FILE" 2>/dev/null)
+
+            SBOM_PACKAGE_LIST=$(jq -r \
+                --argjson hashmap "$_HASH_BY_NAME" \
+                --argjson vexmap "$_VEX_BY_PKG" '
+                # dep-count lookup: bom-ref → number of things it depends on
+                ( reduce (.dependencies // [])[] as $d ({}; .[$d.ref] = ($d.dependsOn | length)) ) as $dep_count |
+                # used-by lookup: each ref appears in dependsOn of others
+                ( reduce (.dependencies // [])[] as $d ({}; reduce $d.dependsOn[] as $r (.; .[$r] = ((.[$r] // 0) + 1))) ) as $used_by |
+                [.components[]?] | sort_by(.name) | .[:500] |
+                map(
+                    . as $c |
+                    ( ($c.licenses // []) | map(.license.id // .license.name // .expression // "") | map(select(. != "")) | join(", ") ) as $lic |
+                    ( if $lic == "" then "Unknown" else $lic end ) as $lic_display |
+                    ( $c.purl // "" | test("pypi"; "i") ) as $is_pypi |
+                    ( $hashmap[$c.name] // (if $is_pypi then "unchecked" else "" end) ) as $hash_st |
+                    ( $vexmap[$c.name + "@" + ($c.version // "")] // [] ) as $vex_cves |
+                    ( $dep_count[$c["bom-ref"]] // 0 ) as $n_deps |
+                    ( $used_by[$c["bom-ref"]] // 0 ) as $n_used_by |
+                    # license badge color
+                    ( if ($lic_display | test("GPL|AGPL|SSPL|EUPL|CDDL|MPL|LGPL"; "i")) then "badge-critical"
+                      elif $lic_display == "Unknown" then "badge-medium"
+                      else "badge-passed" end ) as $lic_class |
+                    # hash badge
+                    ( if $hash_st == "verified" then "<span class=\"badge badge-passed\" title=\"Hash matches PyPI\">✅ hash ok</span>"
+                      elif $hash_st == "tampered" then "<span class=\"badge badge-critical\" title=\"Hash mismatch!\">🚨 tampered</span>"
+                      elif $hash_st == "not_found" then "<span class=\"badge badge-medium\" title=\"Not found on PyPI\">⚠️ not on PyPI</span>"
+                      else "" end ) as $hash_badge |
+                    # VEX badge
+                    ( if ($vex_cves | length) > 0 then
+                        "<span class=\"badge\" style=\"background:#6d28d9;color:white;\" title=\"VEX suppressed: \($vex_cves | join(", "))\">🛡️ \($vex_cves | length) VEX</span>"
+                      else "" end ) as $vex_badge |
+                    "<div class=\"sbom-package-item\" data-name=\"\($c.name | ascii_downcase)\" data-type=\"\($c.type // "library")\" data-version=\"\($c.version // "0.0.0")\" data-language=\"library\" onclick=\"toggleFindingDetails(this)\">" +
+                    "<div class=\"finding-header\">" +
+                    "<span class=\"badge badge-tool\">\($c.type // "library")</span>" +
+                    "<span class=\"badge sbom-version-badge\">\($c.version // "N/A")</span>" +
+                    "<span class=\"badge \($lic_class)\" title=\"License\">\($lic_display)</span>" +
+                    ( if $n_deps > 0 then "<span class=\"badge\" style=\"background:#e0f2fe;color:#0369a1;\">↓\($n_deps) deps</span>" else "" end ) +
+                    ( if $n_used_by > 0 then "<span class=\"badge\" style=\"background:#f0fdf4;color:#166534;\">↑\($n_used_by) uses</span>" else "" end ) +
+                    $hash_badge + $vex_badge +
+                    "</div>" +
+                    "<div class=\"finding-title\">\($c.name | @html)</div>" +
+                    "<div class=\"finding-details\" style=\"display: none;\">" +
+                    "<div><strong>Name:</strong> <code>\($c.name)</code></div>" +
+                    "<div><strong>Version:</strong> <code>\($c.version // "N/A")</code></div>" +
+                    "<div><strong>Type:</strong> <code>\($c.type // "library")</code></div>" +
+                    "<div><strong>License:</strong> <code>\($lic_display)</code></div>" +
+                    "<div><strong>Depends on:</strong> \($n_deps) packages | <strong>Used by:</strong> \($n_used_by) packages</div>" +
+                    ( if $is_pypi and $hash_st != "" then "<div><strong>Hash Status:</strong> \($hash_st)</div>" else "" end ) +
+                    ( if ($vex_cves | length) > 0 then "<div><strong>VEX Suppressed CVEs:</strong> <code>\($vex_cves | join(", "))</code></div>" else "" end ) +
+                    "<div><strong>PURL:</strong> <code>\($c.purl // "N/A")</code></div>" +
+                    "</div></div>"
+                ) | join("\n")
+            ' "$_BEST_SBOM_FILE" 2>/dev/null)
+        else
+            SBOM_TYPE_BREAKDOWN=$(jq -r '[.artifacts[].type] | group_by(.) | map({type: .[0], count: length}) | sort_by(-.count) | .[:15] | map("<button class=\"sbom-filter-chip\" data-type=\"\(.type)\" onclick=\"filterSBOMByType(this, '"'"'\(.type)'"'"')\"><span class=\"type-name\">\(.type)</span><span class=\"type-count\">\(.count)</span></button>") | join("")' "$_BEST_SBOM_FILE" 2>/dev/null)
+
+            SBOM_PACKAGE_LIST=$(jq -r '.artifacts | sort_by(.type) | .[:500] | map("<div class=\"sbom-package-item\" data-name=\"\(.name | ascii_downcase)\" data-type=\"\(.type // "unknown")\" data-version=\"\(.version // "0.0.0")\" data-language=\"\(.language // "unknown")\" onclick=\"toggleFindingDetails(this)\">
+                        <div class=\"finding-header\">
+                            <span class=\"badge badge-tool\">\(.type // "unknown")</span>
+                            <span class=\"badge sbom-version-badge\">\(.version // "N/A")</span>
+                            <span class=\"badge sbom-lang-badge\">\(.language // "")</span>
+                        </div>
+                        <div class=\"finding-title\">\(.name)</div>
+                        <div class=\"finding-details\" style=\"display: none;\">
+                            <div><strong>Name:</strong> <code>\(.name)</code></div>
+                            <div><strong>Version:</strong> <code>\(.version // "N/A")</code></div>
+                            <div><strong>Type:</strong> <code>\(.type // "unknown")</code></div>
+                            <div><strong>Language:</strong> <code>\(.language // "N/A")</code></div>
+                            <div><strong>Licenses:</strong> <code>\(((.licenses // []) | map(.value // .spdxExpression // "Unknown") | join(", ")) // "Not specified")</code></div>
+                            <div><strong>PURL:</strong> <code>\(.purl // "N/A")</code></div>
+                            <div><strong>CPEs:</strong> <code>\(((.cpes // []) | map(.cpe // .) | .[0:3] | join(", ")) // "N/A")</code></div>
+                        </div>
+                    </div>") | join("\n")' "$_BEST_SBOM_FILE" 2>/dev/null)
+        fi
+
+                    SBOM_FINDINGS="<div class=\"sbom-controls\">
+                        <div class=\"sbom-filter-section\">
+                            <span class=\"filter-label\">🔍 Filter by Type:</span>
+                            <div class=\"sbom-filter-chips\">
+                                <button class=\"sbom-filter-chip active\" data-type=\"all\" onclick=\"filterSBOMByType(this, 'all')\">
+                                    <span class=\"type-name\">All</span>
+                                    <span class=\"type-count\">${SBOM_PACKAGES}</span>
+                                </button>
+                                ${SBOM_TYPE_BREAKDOWN}
+                            </div>
+                        </div>
+                        <div class=\"sbom-sort-section\">
+                            <span class=\"filter-label\">⇅ Sort by:</span>
+                            <div class=\"sbom-sort-buttons\">
+                                <button class=\"sbom-sort-btn active\" onclick=\"sortSBOMPackages('name')\" id=\"sbom-sort-name\">📝 Name</button>
+                                <button class=\"sbom-sort-btn\" onclick=\"sortSBOMPackages('type')\" id=\"sbom-sort-type\">📦 Type</button>
+                                <button class=\"sbom-sort-btn\" onclick=\"sortSBOMPackages('version')\" id=\"sbom-sort-version\">🏷️ Version</button>
+                            </div>
+                        </div>
+                        <div class=\"sbom-search-box\">
+                            <input type=\"text\" id=\"sbom-search\" placeholder=\"🔍 Search packages by name, type, or version...\" onkeyup=\"filterSBOMPackages(this.value)\">
+                        </div>
+                    </div>
+                    <div class=\"sbom-results-bar\" id=\"sbom-results-bar\">
+                        <span id=\"sbom-results-count\">Showing ${SBOM_PACKAGES} packages</span>
+                        <a class=\"clear-filter\" onclick=\"resetSBOMFilters()\" style=\"display: none;\" id=\"sbom-clear-filter\">Clear Filters ✕</a>
+                    </div>
+                    <div class=\"sbom-package-list\" id=\"sbom-package-list\">
+                        ${SBOM_PACKAGE_LIST}
+                    </div>
+                    <p style=\"text-align: center; color: #718096; margin-top: 15px;\">Showing first 500 of ${SBOM_PACKAGES} total packages</p>"
+    fi
+    
+    if [ -z "$SBOM_FINDINGS" ]; then
+        SBOM_FINDINGS="<p class=\"no-findings\">✅ No packages cataloged in SBOM</p>"
+    fi
+else
+    SBOM_FINDINGS="<p class=\"no-findings\">No SBOM data available</p>"
+fi
+
+# ---- License Compliance (from CycloneDX SBOM) ----
+CYCLONEDX_FILE=$(find "${LATEST_SCAN}/sbom" -maxdepth 1 -name "*.cyclonedx.json" 2>/dev/null | head -1)
+
+# If no CycloneDX file yet, try to generate one on the fly
+if [[ -z "$CYCLONEDX_FILE" ]] && command -v syft >/dev/null 2>&1; then
+    _CDXOUT="${LATEST_SCAN}/sbom/dashboard-generated.cyclonedx.json"
+    mkdir -p "${LATEST_SCAN}/sbom"
+    # Prefer the live target directory env var; fall back to scan metadata (grep handles malformed JSON)
+    _SBOM_TARGET=""
+    if [[ -n "${TARGET_DIR:-}" && -d "${TARGET_DIR}" ]]; then
+        _SBOM_TARGET="$TARGET_DIR"
+    else
+        _META="${LATEST_SCAN}/scan-metadata.json"
+        if [[ -f "$_META" ]]; then
+            _SBOM_TARGET=$(grep '"target_directory"' "$_META" 2>/dev/null \
+                | sed 's/.*"target_directory"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' || true)
+        fi
+    fi
+    if [[ -n "$_SBOM_TARGET" && -d "$_SBOM_TARGET" ]]; then
+        echo "📦 Generating CycloneDX SBOM for dashboard from: $_SBOM_TARGET" >&2
+        if syft scan "$_SBOM_TARGET" -o "cyclonedx-json=${_CDXOUT}" >/dev/null 2>&1; then
+            CYCLONEDX_FILE="$_CDXOUT"
+        fi
+    fi
+fi
+LICENSE_FINDINGS=""
+LICENSE_DENIED_COUNT=0
+LICENSE_UNKNOWN_COUNT=0
+LICENSE_CLEAN_COUNT=0
+DENIED_PATTERN="GPL-2.0-only|GPL-2.0-or-later|GPL-3.0-only|GPL-3.0-or-later|AGPL-3.0-only|AGPL-3.0-or-later|SSPL-1.0|EUPL-1.2|CDDL-1.0"
+
+if [[ -f "$CYCLONEDX_FILE" ]]; then
+    LICENSE_DENIED_COUNT=$(jq --arg pat "$DENIED_PATTERN" '
+        [.components[]? |
+         (.licenses // [])[] |
+         (.expression // .id // "") |
+         select(. != "" and test($pat))] | length
+    ' "$CYCLONEDX_FILE" 2>/dev/null || echo "0")
+
+    LICENSE_UNKNOWN_COUNT=$(jq '[
+        .components[]? | select((.licenses // []) | length == 0)
+    ] | length' "$CYCLONEDX_FILE" 2>/dev/null || echo "0")
+
+    LICENSE_CLEAN_COUNT=$(jq --arg pat "$DENIED_PATTERN" '
+        [.components[]? |
+         select((.licenses // []) | length > 0) |
+         select([(.licenses // [])[] | (.expression // .id // "") | select(test($pat))] | length == 0)
+        ] | length
+    ' "$CYCLONEDX_FILE" 2>/dev/null || echo "0")
+
+    LICENSE_FINDINGS=$(jq -r --arg pat "$DENIED_PATTERN" '
+        "<table class=\"findings-table\"><thead><tr><th>Package</th><th>Version</th><th>License</th><th>Status</th></tr></thead><tbody>" +
+        ([.components[]? |
+          . as $c |
+          ((.licenses // [])[] | (.expression // .id // "Unknown")) as $lic |
+          "<tr>" +
+          "<td><code>\($c.name)</code></td>" +
+          "<td>\($c.version // "N/A")</td>" +
+          "<td><span class=\"badge badge-tool\">\($lic)</span></td>" +
+          "<td>\(if ($lic | test($pat)) then "<span class=\"badge badge-critical\">Denied</span>" else "<span class=\"badge badge-passed\">Allowed</span>" end)</td>" +
+          "</tr>"
+        ] | join("")) +
+        "</tbody></table>"
+    ' "$CYCLONEDX_FILE" 2>/dev/null)
+
+    if [[ -z "$LICENSE_FINDINGS" ]]; then
+        LICENSE_FINDINGS="<p class=\"no-findings\">✅ No license data in CycloneDX SBOM</p>"
+    fi
+else
+    LICENSE_FINDINGS="<p class=\"no-findings\">No CycloneDX SBOM available — run SBOM scan first</p>"
+fi
+
+# ---- Dependency Lineage ----
+LINEAGE_FILE="${LATEST_SCAN}/sbom/dependency-lineage.json"
+LINEAGE_FINDINGS=""
+LINEAGE_TOP_COUNT=0
+
+if [[ -f "$LINEAGE_FILE" ]]; then
+    LINEAGE_TOP_COUNT=$(jq '.python | if type == "array" then length else 0 end' "$LINEAGE_FILE" 2>/dev/null || echo "0")
+
+    LINEAGE_FINDINGS=$(jq -r '
+        .python |
+        if type != "array" or length == 0 then
+            "<p class=\"no-findings\">No Python dependency tree available</p>"
+        else
+            "<div class=\"sbom-package-list\">" +
+            (map(
+                "<div class=\"sbom-package-item\" onclick=\"toggleFindingDetails(this)\">" +
+                "<div class=\"finding-header\">" +
+                "<span class=\"badge badge-tool\">direct</span>" +
+                "<span class=\"badge sbom-version-badge\">\(.installed_version)</span>" +
+                "</div>" +
+                "<div class=\"finding-title\">\(.package_name)</div>" +
+                "<div class=\"finding-details\" style=\"display:none;\">" +
+                "<div><strong>Direct Children:</strong> " +
+                (if (.dependencies | length) > 0 then
+                    ([ .dependencies[] | "<code>\(.package_name)@\(.installed_version)</code>" ] | join(", "))
+                else "none" end) +
+                "</div></div></div>"
+            ) | join("\n")) +
+            "</div>"
+        end
+    ' "$LINEAGE_FILE" 2>/dev/null)
+
+    [[ -z "$LINEAGE_FINDINGS" ]] && LINEAGE_FINDINGS="<p class=\"no-findings\">Dependency lineage data unavailable</p>"
+elif [[ -f "$CYCLONEDX_FILE" ]]; then
+    # Fall back to the dependencies[] array already in the CycloneDX SBOM (populated by syft)
+    LINEAGE_TOP_COUNT=$(jq '[.dependencies[]? | select(.dependsOn | length > 0)] | length' "$CYCLONEDX_FILE" 2>/dev/null || echo "0")
+
+    LINEAGE_FINDINGS=$(jq -r '
+        # Build a ref→name lookup from components
+        ( [ .components[]? | { key: .["bom-ref"], value: (.name + "@" + (.version // "?")) } ] | from_entries ) as $names |
+        [.dependencies[]? | select(.dependsOn | length > 0)] |
+        if length == 0 then
+            "<p class=\"no-findings\">No dependency relationships in SBOM</p>"
+        else
+            "<div class=\"sbom-package-list\">" +
+            (map(
+                . as $d |
+                # Extract name@version from purl: pkg:npm/name@ver?... or pkg:type/name@ver
+                ($d.ref | gsub("\\?.*";"") | split("/") | last | split("@") | [.[0], (.[1] // "?")] ) as $nv |
+                "<div class=\"sbom-package-item\" onclick=\"toggleFindingDetails(this)\">" +
+                "<div class=\"finding-header\">" +
+                "<span class=\"badge badge-tool\">\($d.dependsOn | length) deps</span>" +
+                "<span class=\"badge sbom-version-badge\">\($nv[1])</span>" +
+                "</div>" +
+                "<div class=\"finding-title\">\($nv[0] | @html)</div>" +
+                "<div class=\"finding-details\" style=\"display:none;\">" +
+                "<div><strong>Depends on:</strong> " +
+                ( $d.dependsOn |
+                  map(gsub("\\?.*";"") | split("/") | last | split("@") | "\(.[0])@\(.[1] // "?")") |
+                  map("<code>\(.)</code>") | join(", ")
+                ) +
+                "</div></div></div>"
+            ) | join("\n")) +
+            "</div>"
+        end
+    ' "$CYCLONEDX_FILE" 2>/dev/null)
+
+    [[ -z "$LINEAGE_FINDINGS" ]] && LINEAGE_FINDINGS="<p class=\"no-findings\">Dependency lineage data unavailable</p>"
+else
+    LINEAGE_FINDINGS="<p class=\"no-findings\">Dependency lineage not yet generated — install pipdeptree</p>"
+fi
+
+# ---- Hash Verification ----
+HASH_VERIFY_FILE="${LATEST_SCAN}/sbom/hash-verification.json"
+HASH_VERIFY_FINDINGS=""
+HASH_TOTAL=0; HASH_VERIFIED=0; HASH_TAMPERED=0; HASH_NOT_FOUND=0
+
+if [[ -f "$HASH_VERIFY_FILE" ]]; then
+    HASH_TOTAL=$(jq '.summary.total // 0' "$HASH_VERIFY_FILE" 2>/dev/null || echo "0")
+    HASH_VERIFIED=$(jq '.summary.verified // 0' "$HASH_VERIFY_FILE" 2>/dev/null || echo "0")
+    HASH_TAMPERED=$(jq '.summary.tampered // 0' "$HASH_VERIFY_FILE" 2>/dev/null || echo "0")
+    HASH_NOT_FOUND=$(jq '.summary.not_found // 0' "$HASH_VERIFY_FILE" 2>/dev/null || echo "0")
+
+    HASH_VERIFY_FINDINGS=$(jq -r '
+        "<div class=\"stats-detail-box\">" +
+        "<h4>🔐 Hash Verification Summary</h4>" +
+        "<div class=\"stats-grid-small\">" +
+        "<div class=\"stat-item\"><strong>Total checked:</strong> \(.summary.total)</div>" +
+        "<div class=\"stat-item\"><strong>✅ Verified:</strong> \(.summary.verified)</div>" +
+        "<div class=\"stat-item\"><strong>🚨 Mismatches:</strong> \(.summary.tampered)</div>" +
+        "<div class=\"stat-item\"><strong>⚠️ Not on PyPI:</strong> \(.summary.not_found)</div>" +
+        "</div></div>" +
+        (if (.tampered | length) > 0 then
+            "<h4>🚨 Hash Mismatches — Investigate Immediately</h4>" +
+            "<table class=\"findings-table\"><thead><tr><th>Package</th><th>Version</th><th>Installed Hash</th><th>Status</th></tr></thead><tbody>" +
+            ([.tampered[] |
+                "<tr><td><code>\(.name)</code></td><td>\(.version)</td><td><code style=\"font-size:0.75em\">\(.sha256_found[0:16])...</code></td><td><span class=\"badge badge-critical\">MISMATCH</span></td></tr>"
+            ] | join("")) +
+            "</tbody></table>"
+        else "<p class=\"no-findings\">✅ All checked packages match PyPI hashes</p>" end)
+    ' "$HASH_VERIFY_FILE" 2>/dev/null)
+
+    [[ -z "$HASH_VERIFY_FINDINGS" ]] && HASH_VERIFY_FINDINGS="<p class=\"no-findings\">Hash verification data unavailable</p>"
+else
+    # Try to run hash verification on-the-fly using the CycloneDX file
+    if [[ -f "$CYCLONEDX_FILE" ]]; then
+        _PYPI_COUNT=$(jq '[.components[]? | select(.purl // "" | test("pypi"))] | length' "$CYCLONEDX_FILE" 2>/dev/null || echo "0")
+        if [[ "$_PYPI_COUNT" -gt 0 ]]; then
+            _HASH_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/verify-sbom-hashes.sh"
+            if [[ -f "$_HASH_SCRIPT" ]]; then
+                echo "🔐 Running hash verification on-the-fly ($_PYPI_COUNT PyPI packages)..." >&2
+                SCAN_DIR="$LATEST_SCAN" bash "$_HASH_SCRIPT" >/dev/null 2>&1 || true
+            fi
+        fi
+    fi
+    if [[ -f "$HASH_VERIFY_FILE" ]]; then
+        HASH_TOTAL=$(jq '.summary.total // 0' "$HASH_VERIFY_FILE" 2>/dev/null || echo "0")
+        HASH_VERIFIED=$(jq '.summary.verified // 0' "$HASH_VERIFY_FILE" 2>/dev/null || echo "0")
+        HASH_TAMPERED=$(jq '.summary.tampered // 0' "$HASH_VERIFY_FILE" 2>/dev/null || echo "0")
+        HASH_NOT_FOUND=$(jq '.summary.not_found // 0' "$HASH_VERIFY_FILE" 2>/dev/null || echo "0")
+        HASH_VERIFY_FINDINGS=$(jq -r '
+            "<div class=\"stats-detail-box\">" +
+            "<h4>🔐 Hash Verification Summary</h4>" +
+            "<div class=\"stats-grid-small\">" +
+            "<div class=\"stat-item\"><strong>Total checked:</strong> \(.summary.total)</div>" +
+            "<div class=\"stat-item\"><strong>✅ Verified:</strong> \(.summary.verified)</div>" +
+            "<div class=\"stat-item\"><strong>🚨 Mismatches:</strong> \(.summary.tampered)</div>" +
+            "<div class=\"stat-item\"><strong>⚠️ Not on PyPI:</strong> \(.summary.not_found)</div>" +
+            "</div></div>"
+        ' "$HASH_VERIFY_FILE" 2>/dev/null)
+    else
+        # Determine a meaningful message based on what packages exist
+        _PYPI_COUNT=0
+        [[ -f "$CYCLONEDX_FILE" ]] && _PYPI_COUNT=$(jq '[.components[]? | select(.purl // "" | test("pypi"))] | length' "$CYCLONEDX_FILE" 2>/dev/null || echo "0")
+        if [[ "$_PYPI_COUNT" -eq 0 ]]; then
+            HASH_VERIFY_FINDINGS="<p class=\"no-findings\">✅ No PyPI packages in SBOM — hash verification not applicable for this project</p>"
+        else
+            HASH_VERIFY_FINDINGS="<p class=\"no-findings\">Hash verification not run — will run automatically on next scan</p>"
+        fi
+    fi
+fi
+
+# ---- VEX Statements ----
+VEX_DIR="${LATEST_SCAN%/*}"   # parent of scan dir — repo root to find TARGET_DIR heuristic
+# Look for VEX docs in scan dir first, then common repo roots
+VEX_SUMMARY_FILE="${LATEST_SCAN}/grype/vex-summary.json"
+VEX_FINDINGS=""
+VEX_STATEMENT_COUNT=0
+VEX_SUPPRESSED=0
+
+GRYPE_BEFORE=0; GRYPE_AFTER=0
+if [[ -f "${LATEST_SCAN}/grype/grype-sbom-results.json" ]]; then
+    GRYPE_BEFORE=$(jq '.matches | length' "${LATEST_SCAN}/grype/grype-sbom-results.json" 2>/dev/null || echo "0")
+fi
+if [[ -f "${LATEST_SCAN}/grype/vex-applied-results.json" ]]; then
+    GRYPE_AFTER=$(jq '.matches | length' "${LATEST_SCAN}/grype/vex-applied-results.json" 2>/dev/null || echo "0")
+    VEX_SUPPRESSED=$((GRYPE_BEFORE - GRYPE_AFTER))
+fi
+
+if [[ -f "$VEX_SUMMARY_FILE" ]]; then
+    VEX_STATEMENT_COUNT=$(jq '.vex_documents // 0' "$VEX_SUMMARY_FILE" 2>/dev/null || echo "0")
+    VEX_FINDINGS=$(jq -r '
+        "<table class=\"findings-table\"><thead><tr><th>CVE</th><th>Status</th><th>Justification</th><th>Detail</th></tr></thead><tbody>" +
+        ([.statements[] |
+            "<tr>" +
+            "<td><code>\(.cve // "N/A")</code></td>" +
+            "<td><span class=\"badge badge-passed\">\(.status // "not_affected")</span></td>" +
+            "<td>\(.justification // "N/A")</td>" +
+            "<td>\(.detail // "")</td>" +
+            "</tr>"
+        ] | join("")) +
+        "</tbody></table>"
+    ' "$VEX_SUMMARY_FILE" 2>/dev/null)
+    [[ -z "$VEX_FINDINGS" ]] && VEX_FINDINGS="<p class=\"no-findings\">No VEX statements available</p>"
+else
+    VEX_FINDINGS="<p class=\"no-findings\">No VEX documents found — use <code>run-vex.sh create &lt;CVE-ID&gt; ...</code> to add suppression justifications</p>"
+fi
+
+# ---- Checkov Statistics ----
+CHECKOV_DIR="${LATEST_SCAN}/checkov"
+CHECKOV_PASSED=0
+CHECKOV_FAILED=0
+CHECKOV_FAILED_RAW=0
+CHECKOV_SUPPRESSED=0
+CHECKOV_SKIPPED=0
+CHECKOV_FILES_SCANNED=0
+CHECKOV_CHECK_TYPES=""
+if [ -d "$CHECKOV_DIR" ]; then
+    # Use find -type f to reach results_json.json files inside checkov-results.json/ subdirectories
+    # (Checkov's --output-file creates a directory named *.json containing results_json.json)
+    while IFS= read -r checkov_file; do
+        # Skip symlinks to avoid duplicate processing
+        if [ -f "$checkov_file" ] && [ ! -L "$checkov_file" ] && [[ "$(basename "$checkov_file")" != *"summary"* ]]; then
+            # Checkov output is an array - iterate through all check types
+            # First element [0] is summary, subsequent elements contain results by check type
+            
+            # Sum up all passed/failed/skipped from all check types
+            passed=$(jq '[.[] | select(.results?) | .results.passed_checks | length] | add // 0' "$checkov_file" 2>/dev/null || echo "0")
+            failed_raw=$(jq '[.[] | select(.results?) | .results.failed_checks | length] | add // 0' "$checkov_file" 2>/dev/null || echo "0")
+            skipped=$(jq '[.[] | select(.results?) | .results.skipped_checks | length] | add // 0' "$checkov_file" 2>/dev/null || echo "0")
+            
+            # Get check types scanned
+            check_types=$(jq -r '[.[] | select(.check_type?) | .check_type] | unique | join(", ")' "$checkov_file" 2>/dev/null || echo "")
+            
+            [[ "$passed" =~ ^[0-9]+$ ]] || passed=0
+            [[ "$failed_raw" =~ ^[0-9]+$ ]] || failed_raw=0
+            [[ "$skipped" =~ ^[0-9]+$ ]] || skipped=0
+            
+            CHECKOV_PASSED=$((CHECKOV_PASSED + passed))
+            CHECKOV_FAILED_RAW=$((CHECKOV_FAILED_RAW + failed_raw))
+            CHECKOV_SKIPPED=$((CHECKOV_SKIPPED + skipped))
+            CHECKOV_CHECK_TYPES="$check_types"
+            
+            # Count failed checks with suppression filtering
+            set +e
+            while IFS=$'\t' read -r file_path check_id; do
+                if [ -n "$file_path" ]; then
+                    # Strip /workspace/ prefix added by Docker volume mount
+                    clean_file_path="${file_path#/workspace/}"
+                    # Check if check_id (e.g. CKV_AWS_260) or path is suppressed
+                    is_suppressed=false
+                    if declare -f is_cve_ignored >/dev/null 2>&1 && [ -n "$check_id" ]; then
+                        if is_cve_ignored "$check_id" "Checkov" 2>/dev/null; then
+                            is_suppressed=true
+                        fi
+                    fi
+                    if [ "$is_suppressed" = false ] && declare -f is_path_ignored >/dev/null 2>&1; then
+                        if is_path_ignored "$clean_file_path" "Checkov" 2>/dev/null; then
+                            is_suppressed=true
+                        fi
+                    fi
+                    
+                    if [ "$is_suppressed" = true ]; then
+                        ((CHECKOV_SUPPRESSED++)) || CHECKOV_SUPPRESSED=1
+                    else
+                        ((CHECKOV_FAILED++)) || CHECKOV_FAILED=1
+                    fi
+                fi
+            done < <(jq -r '.[]? | .results.failed_checks[]? | [.file_path, .check_id] | @tsv' "$checkov_file" 2>/dev/null || echo "")
+            set -e
+        fi
+    done < <(find "$CHECKOV_DIR" -type f -name "*.json" ! -name "*summary*" 2>/dev/null | sort)
+fi
+# Note: Checkov failed checks are IaC misconfigurations, NOT vulnerability criticals
+# They should be counted as HIGH priority issues, not CRITICAL vulnerabilities
+CHECKOV_CRITICAL=0
+CHECKOV_HIGH=$CHECKOV_FAILED
+CHECKOV_TOTAL=$((CHECKOV_PASSED + CHECKOV_FAILED + CHECKOV_SUPPRESSED + CHECKOV_SKIPPED))
+
+# Read Checkov statistics file for detailed info
+CHECKOV_STATS_FILE="$CHECKOV_DIR/checkov-statistics.json"
+CHECKOV_FILES_SCANNED=0
+CHECKOV_YAML_COUNT=0
+CHECKOV_TF_COUNT=0
+CHECKOV_DOCKER_COUNT=0
+CHECKOV_JSON_COUNT=0
+CHECKOV_HELM_COUNT=0
+CHECKOV_SCAN_DURATION="N/A"
+if [ -f "$CHECKOV_STATS_FILE" ]; then
+    CHECKOV_FILES_SCANNED=$(jq -r '.files_scanned // 0' "$CHECKOV_STATS_FILE" 2>/dev/null || echo "0")
+    CHECKOV_YAML_COUNT=$(jq -r '.yaml_count // 0' "$CHECKOV_STATS_FILE" 2>/dev/null || echo "0")
+    CHECKOV_TF_COUNT=$(jq -r '.terraform_count // 0' "$CHECKOV_STATS_FILE" 2>/dev/null || echo "0")
+    CHECKOV_DOCKER_COUNT=$(jq -r '.dockerfile_count // 0' "$CHECKOV_STATS_FILE" 2>/dev/null || echo "0")
+    CHECKOV_JSON_COUNT=$(jq -r '.json_count // 0' "$CHECKOV_STATS_FILE" 2>/dev/null || echo "0")
+    CHECKOV_HELM_COUNT=$(jq -r '.helm_count // 0' "$CHECKOV_STATS_FILE" 2>/dev/null || echo "0")
+    CHECKOV_SCAN_DURATION=$(jq -r '.scan_duration // "N/A"' "$CHECKOV_STATS_FILE" 2>/dev/null || echo "N/A")
+fi
+
+# Build Checkov findings display
+if [ "$CHECKOV_TOTAL" -gt 0 ]; then
+    CHECKOV_FINDINGS="<div class=\"stats-grid-small\">
+        <div class=\"stat-item\"><strong>✅ Passed:</strong> ${CHECKOV_PASSED}</div>
+        <div class=\"stat-item\"><strong>❌ Failed:</strong> ${CHECKOV_FAILED}</div>
+        <div class=\"stat-item\"><strong>⏭️ Skipped:</strong> ${CHECKOV_SKIPPED}</div>"
+    if [ "$CHECKOV_SUPPRESSED" -gt 0 ]; then
+        CHECKOV_FINDINGS="${CHECKOV_FINDINGS}
+        <div class=\"stat-item\"><strong>🔕 Suppressed:</strong> ${CHECKOV_SUPPRESSED}</div>"
+    fi
+    CHECKOV_FINDINGS="${CHECKOV_FINDINGS}
+        <div class=\"stat-item\"><strong>📊 Total Checks:</strong> ${CHECKOV_TOTAL}</div>
+        <div class=\"stat-item\"><strong>📁 Files Scanned:</strong> ${CHECKOV_FILES_SCANNED}</div>
+        <div class=\"stat-item\"><strong>⏱️ Scan Duration:</strong> ${CHECKOV_SCAN_DURATION}s</div>
+    </div>"
+    if [ "$CHECKOV_FILES_SCANNED" -gt 0 ]; then
+        CHECKOV_FINDINGS="${CHECKOV_FINDINGS}<div style='margin-top:10px;padding:10px;background:#e0f2fe;border-left:3px solid #0369a1;'>"
+        CHECKOV_FINDINGS="${CHECKOV_FINDINGS}<strong>File Type Breakdown:</strong><br/>"
+        CHECKOV_FINDINGS="${CHECKOV_FINDINGS}📄 YAML/YML: ${CHECKOV_YAML_COUNT} | 🏗️ Terraform: ${CHECKOV_TF_COUNT} | 🐳 Dockerfiles: ${CHECKOV_DOCKER_COUNT} | 📋 JSON: ${CHECKOV_JSON_COUNT} | ⎈ Helm: ${CHECKOV_HELM_COUNT}"
+        CHECKOV_FINDINGS="${CHECKOV_FINDINGS}</div>"
+    fi
+    if [ -n "$CHECKOV_CHECK_TYPES" ]; then
+        CHECKOV_FINDINGS="${CHECKOV_FINDINGS}<p style=\"margin-top: 10px; color: #718096;\">Frameworks: ${CHECKOV_CHECK_TYPES}</p>"
+    fi
+    
+    # Add failed checks details if any failures exist
+    if [ "$CHECKOV_FAILED" -gt 0 ]; then
+        CHECKOV_FINDINGS="${CHECKOV_FINDINGS}<div class=\"findings-section\" style=\"margin-top: 15px;\">
+            <h4 style=\"color: #dd6b20; margin-bottom: 10px;\">⚠️ Failed IaC Checks (${CHECKOV_FAILED})</h4>
+            <p style=\"color:#718096;margin-bottom:15px;font-size:0.9em;\">👆 Click on any finding below to expand details. These are IaC/Dockerfile misconfigurations, not vulnerabilities.</p>"
+        
+        # Extract failed checks from all Checkov JSON files
+        # Use find -type f to reach results_json.json inside checkov-results.json/ subdirectories
+        while IFS= read -r checkov_file; do
+            # Skip symlinks to avoid duplicate processing
+            if [ -f "$checkov_file" ] && [ ! -L "$checkov_file" ] && [[ "$(basename "$checkov_file")" != *"summary"* ]]; then
+                # Get failed checks as TSV for easy parsing
+                while IFS=$'\t' read -r check_id check_name file_path line_start guideline; do
+                    if [ -n "$check_id" ]; then
+                        # Strip /workspace/ prefix added by Docker volume mount
+                        clean_file_path="${file_path#/workspace/}"
+                        # Check if check_id (e.g. CKV_AWS_260) or path is suppressed
+                        is_suppressed=false
+                        if declare -f is_cve_ignored >/dev/null 2>&1; then
+                            if is_cve_ignored "$check_id" "Checkov" 2>/dev/null; then
+                                is_suppressed=true
+                            fi
+                        fi
+                        if [ "$is_suppressed" = false ] && declare -f is_path_ignored >/dev/null 2>&1; then
+                            if is_path_ignored "$clean_file_path" "Checkov" 2>/dev/null; then
+                                is_suppressed=true
+                            fi
+                        fi
+                        
+                        if [ "$is_suppressed" = true ]; then
+                            # Skip suppressed findings (they're in the suppressed section)
+                            continue
+                        fi
+                        
+                        # Escape HTML entities
+                        check_name_escaped=$(echo "$check_name" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g')
+                        file_display=$(basename "$file_path" 2>/dev/null || echo "$file_path")
+                        guideline_escaped=$(echo "$guideline" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g')
+                        CHECKOV_FINDINGS="${CHECKOV_FINDINGS}
+<div class=\"finding-item severity-high\" data-source=\"app\" onclick=\"toggleFindingDetails(this)\">
+    <div class=\"finding-header\">
+        <span class=\"badge badge-tool\">Checkov</span>
+        <span class=\"badge badge-high\">HIGH</span>
+        <span class=\"badge\" style=\"background:#2C3539;color:#9ca3af;border:1px solid #4a5568;\">${check_id}</span>
+        <span class=\"badge\" style=\"background:#152a1f;color:#4ade80;font-size:0.7em;border:1px solid #10b981;\">💻 App Code</span>
+    </div>
+    <div class=\"finding-title\">${check_name_escaped}</div>
+    <div class=\"finding-desc\">IaC misconfiguration in ${file_display} at line ${line_start}</div>
+    <div class=\"finding-details\" style=\"display:none;\">
+        <div><strong>Check ID:</strong> <code>${check_id}</code></div>
+        <div><strong>Check Name:</strong> ${check_name_escaped}</div>
+        <div><strong>Source:</strong> 💻 Application Code (IaC/Dockerfile configuration)</div>
+        <div><strong>File:</strong> <code>${file_display}</code></div>
+        <div><strong>Full Path:</strong> <code style=\"font-size:0.8em;word-break:break-all;\">${file_path}</code></div>
+        <div><strong>Line:</strong> ${line_start}</div>
+        <div><strong>Guideline:</strong> ${guideline_escaped:-No guideline available}</div>
+    </div>
+</div>"
+                    fi
+                done < <(jq -r '.[]? | .results.failed_checks[]? | [.check_id, .check_name, .file_path, (.file_line_range[0] // "N/A" | tostring), (.guideline // "")] | @tsv' "$checkov_file" 2>/dev/null)
+            fi
+        done < <(find "$CHECKOV_DIR" -type f -name "*.json" ! -name "*summary*" 2>/dev/null | sort)
+        
+        CHECKOV_FINDINGS="${CHECKOV_FINDINGS}
+        </div>"
+    fi
+else
+    # Check if Checkov actually ran or was skipped
+    if [ "${SCAN_MODE:-full}" = "quick" ] && { [ ! -d "$CHECKOV_DIR" ] || [ -z "$(find "$CHECKOV_DIR" -name '*.json' -type f ! -name '*summary*' 2>/dev/null)" ]; }; then
+        CHECKOV_FINDINGS="<div style='padding:20px;text-align:center;background:linear-gradient(135deg,#1a1d23 0%,#2C3539 100%);border:2px solid #6366f1;border-radius:8px;'><p style='color:#818cf8;font-size:1.1em;'>&#x23ED;&#xFE0F; <strong>Not run in quick mode</strong></p><p style='color:#9ca3af;font-size:0.9em;margin-top:8px;'>Checkov IaC scanning is skipped for faster PR scans. Run a full scan (push or scheduled) for complete results.</p></div>"
+    elif [ ! -d "$CHECKOV_DIR" ] || [ -z "$(find "$CHECKOV_DIR" -name '*.json' -type f ! -name '*summary*' 2>/dev/null)" ]; then
+        CHECKOV_FINDINGS="<div style='padding: 20px; text-align: center; color: #718096;'>
+            <p><strong>ℹ️ Checkov scan was not executed or produced no results</strong></p>
+            <p style='font-size: 0.9em; margin-top: 10px;'>This could indicate:</p>
+            <ul style='text-align: left; display: inline-block; margin-top: 10px;'>
+                <li>No IaC files (Terraform, Kubernetes, Helm, Dockerfile) were found</li>
+                <li>Scan failed to complete (check logs)</li>
+            </ul>
+        </div>"
+    else
+        CHECKOV_FINDINGS="<div style='padding: 20px; text-align: center; color: #10b981;'>
+            <p><strong>✅ All Checkov checks passed!</strong></p>
+            <p style='font-size: 0.9em; margin-top: 10px;'>No IaC misconfigurations found.</p>
+        </div>"
+    fi
+fi
+
+# ---- Anchore Statistics ----
+ANCHORE_DIR="${LATEST_SCAN}/anchore"
+ANCHORE_TARGETS_SCANNED=0
+ANCHORE_TOTAL_VULNS=0
+ANCHORE_CRITICAL=0
+ANCHORE_HIGH=0
+ANCHORE_MEDIUM=0
+ANCHORE_LOW=0
+ANCHORE_FINDINGS=""
+ANCHORE_DETAILS=""
+ANCHORE_STATUS="Not Run"
+ANCHORE_CONTAINERS=()   # unique container/source labels for filter chips
+
+# Track seen vulnerabilities for deduplication (simple string approach)
+ANCHORE_SEEN_VULNS=""
+
+# Check if Anchore is suppressed via .barbatos-ignore.yml — skip section entirely if so.
+_ANCHORE_TOOL_SUPPRESSED=false
+if declare -f is_tool_ignored >/dev/null 2>&1 && is_tool_ignored "anchore" 2>/dev/null; then
+    _ANCHORE_TOOL_SUPPRESSED=true
+    echo "⏭️  Anchore suppressed by .barbatos-ignore.yml — skipping dashboard section"
+    ANCHORE_STATUS="Suppressed"
+    ANCHORE_FINDINGS="<div style='padding:20px;text-align:center;background:linear-gradient(135deg,#1a1d23 0%,#2C3539 100%);border:2px solid #6366f1;border-radius:8px;'><p style='color:#818cf8;font-size:1.1em;'>&#x23F8;&#xFE0F; <strong>Suppressed by .barbatos-ignore.yml</strong></p><p style='color:#9ca3af;font-size:0.9em;margin-top:8px;'>Anchore findings are temporarily suppressed. See suppressed-findings.md for details.</p></div>"
+fi
+
+if [ -d "$ANCHORE_DIR" ] && [ "$_ANCHORE_TOOL_SUPPRESSED" = "false" ]; then
+    # Count JSON result files
+    ANCHORE_TARGETS_SCANNED=$(find "$ANCHORE_DIR" -name "*-results.json" -type f 2>/dev/null | wc -l | tr -d ' \n' || echo "0")
+    [[ "$ANCHORE_TARGETS_SCANNED" =~ ^[0-9]+$ ]] || ANCHORE_TARGETS_SCANNED=0
+    
+    if [ "$ANCHORE_TARGETS_SCANNED" -gt 0 ]; then
+        ANCHORE_STATUS="Complete"
+    fi
+    
+    # Process filesystem results first, then images (skip SBOM as it duplicates filesystem)
+    for anchore_file in "$ANCHORE_DIR"/anchore-filesystem-results.json "$ANCHORE_DIR"/images/*.json; do
+        if [ -f "$anchore_file" ] && [ ! -L "$anchore_file" ]; then
+
+            # Determine source label: prefer the image name embedded in the JSON (.source),
+            # fall back to deriving it from the filename for image results.
+            _source_label="Filesystem"
+            _source_type="app"
+            _distro_name=""
+            _distro_ver=""
+            _image_size_mb=""
+            _image_digest_short=""
+            _image_tags_str=""
+            _image_layer_count=""
+            if [[ "$anchore_file" == *"/images/"* ]]; then
+                _source_type="image"
+                # Grype stores the scanned image in .source.target.userInput or .source.target.repoDigests
+                _source_label=$(jq -r '
+                    .source.target.userInput //
+                    (.source.target.repoDigests // [] | first) //
+                    (.source.target.tags // [] | first) //
+                    ""
+                ' "$anchore_file" 2>/dev/null)
+                # Fall back to filename-derived label if JSON field is empty
+                if [ -z "$_source_label" ]; then
+                    _source_label=$(basename "$anchore_file" .json | sed 's/^baseline-//')
+                fi
+
+                # Per-image metadata (top-level, displayed as a section header)
+                _distro_name=$(jq -r '.distro.name // ""' "$anchore_file" 2>/dev/null)
+                _distro_ver=$(jq -r '.distro.version // ""' "$anchore_file" 2>/dev/null)
+                _raw_size=$(jq -r '.source.target.imageSize // ""' "$anchore_file" 2>/dev/null)
+                if [ -n "$_raw_size" ] && [ "$_raw_size" != "null" ]; then
+                    _image_size_mb=$(awk "BEGIN {printf \"%.1f\", ${_raw_size}/1048576}")
+                fi
+                _image_digest_full=$(jq -r '.source.target.manifestDigest // ""' "$anchore_file" 2>/dev/null)
+                [ -n "$_image_digest_full" ] && _image_digest_short="${_image_digest_full:0:19}..."
+                _image_tags_str=$(jq -r '(.source.target.tags // []) | join(", ")' "$anchore_file" 2>/dev/null)
+                _image_layer_count=$(jq -r '(.source.target.layers // []) | length | tostring' "$anchore_file" 2>/dev/null)
+
+                # Build image metadata header div
+                _meta_parts=""
+                [ -n "$_distro_name" ] && _meta_parts="${_meta_parts}<span style=\"margin-right:12px;\">🐧 <strong>OS:</strong> ${_distro_name} ${_distro_ver}</span>"
+                [ -n "$_image_size_mb" ] && _meta_parts="${_meta_parts}<span style=\"margin-right:12px;\">📦 <strong>Size:</strong> ${_image_size_mb} MB</span>"
+                [ -n "$_image_layer_count" ] && [ "$_image_layer_count" != "0" ] && _meta_parts="${_meta_parts}<span style=\"margin-right:12px;\">🔢 <strong>Layers:</strong> ${_image_layer_count}</span>"
+                [ -n "$_image_digest_short" ] && _meta_parts="${_meta_parts}<span style=\"margin-right:12px;\">🔑 <strong>Digest:</strong> <code style=\"font-size:0.8em;\">${_image_digest_short}</code></span>"
+                [ -n "$_image_tags_str" ] && _meta_parts="${_meta_parts}<span>🏷️ <strong>Tags:</strong> ${_image_tags_str}</span>"
+                if [ -n "$_meta_parts" ]; then
+                    source_label_escaped=$(echo "$_source_label" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g')
+                    ANCHORE_DETAILS="${ANCHORE_DETAILS}
+<div style=\"background:linear-gradient(135deg,#0f1f35 0%,#1a2a3a 100%);border:1px solid #3b82f6;border-radius:8px;padding:12px 16px;margin:16px 0 6px 0;\">
+    <div style=\"font-weight:700;color:#60a5fa;margin-bottom:6px;\">🐳 ${source_label_escaped}</div>
+    <div style=\"display:flex;flex-wrap:wrap;gap:4px 0;color:#9ca3af;font-size:0.85em;\">${_meta_parts}</div>
+</div>"
+                fi
+            fi
+
+            # Extract vulnerabilities and count by severity
+            # NOTE: Use | as delimiter (not tab) so empty fields don't collapse (bash tab-IFS collapses adjacent whitespace delimiters)
+            while IFS='|' read -r vuln_id severity package version fixed_ver cve_url \
+                    epss_score epss_pct risk_score \
+                    cvss3_score cvss3_vec cvss3_exploit cvss3_impact \
+                    cwes namespace layer_id match_type adv_urls upstream pkg_path; do
+                if [ -n "$vuln_id" ]; then
+                    # Reset derived variables so they don't bleed across loop iterations
+                    cvss_badge_html="" epss_badge_html="" cvss_color="" cvss_float="" epss_color="" epss_pct_fmt=""
+                    namespace_escaped="" upstream_escaped="" pkg_path_escaped="" cwes_escaped="" layer_id_short=""
+
+                    # Dedup key includes source so the same CVE in two containers shows separately
+                    VULN_KEY="${vuln_id}|${package}|${version}|${_source_label}"
+
+                    if [[ "$ANCHORE_SEEN_VULNS" == *"|${VULN_KEY}|"* ]]; then
+                        continue
+                    fi
+                    ANCHORE_SEEN_VULNS="${ANCHORE_SEEN_VULNS}|${VULN_KEY}|"
+
+                    ((ANCHORE_TOTAL_VULNS++)) || true
+                    case "$severity" in
+                        Critical) ((ANCHORE_CRITICAL++)) || true ;;
+                        High) ((ANCHORE_HIGH++)) || true ;;
+                        Medium) ((ANCHORE_MEDIUM++)) || true ;;
+                        Low) ((ANCHORE_LOW++)) || true ;;
+                    esac
+
+                    # Escape special characters for HTML
+                    package_escaped=$(echo "$package" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g')
+                    version_escaped=$(echo "$version" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g')
+                    fixed_escaped=$(echo "$fixed_ver" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g')
+                    source_escaped=$(echo "$_source_label" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g')
+                    namespace_escaped=$(echo "$namespace" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g')
+                    upstream_escaped=$(echo "$upstream" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g')
+                    pkg_path_escaped=$(echo "$pkg_path" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g')
+                    cwes_escaped=$(echo "$cwes" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g')
+                    layer_id_short=""
+                    [ -n "$layer_id" ] && [ "$layer_id" != "null" ] && layer_id_short="${layer_id:0:19}..."
+
+                    badge_class="badge-high"
+                    case "$severity" in
+                        Critical) badge_class="badge-critical" ;;
+                        Medium) badge_class="badge-medium" ;;
+                        Low) badge_class="badge-low" ;;
+                    esac
+
+                    if [ "$_source_type" = "image" ]; then
+                        source_badge_html="<span class=\"badge\" style=\"background:#1a2a3a;color:#60a5fa;border:1px solid #3b82f6;font-size:0.7em;\">🐳 ${source_escaped}</span>"
+                    else
+                        source_badge_html="<span class=\"badge\" style=\"background:#152a1f;color:#4ade80;border:1px solid #10b981;font-size:0.7em;\">💻 Filesystem</span>"
+                    fi
+
+                    # CVSS badge in header
+                    cvss_badge_html=""
+                    if [ -n "$cvss3_score" ] && [ "$cvss3_score" != "null" ] && [ "$cvss3_score" != "" ]; then
+                        cvss_float=$(echo "$cvss3_score" | awk '{printf "%.1f", $1}')
+                        cvss_color=$(echo "$cvss3_score" | awk '{
+                            s=$1+0
+                            if (s>=9.0) print "#C41E3A"
+                            else if (s>=7.0) print "#FF1493"
+                            else if (s>=4.0) print "#f97316"
+                            else if (s>0.0)  print "#4ade80"
+                            else print "#9ca3af"
+                        }')
+                        cvss_badge_html="<span class=\"badge\" style=\"background:#1a2b3c;color:${cvss_color};border:1px solid #3b82f6;\">CVSS ${cvss_float}</span>"
+                    fi
+
+                    # EPSS badge in header
+                    epss_badge_html=""
+                    if [ -n "$epss_score" ] && [ "$epss_score" != "null" ] && [ "$epss_score" != "" ]; then
+                        epss_color=$(echo "$epss_score" | awk '{
+                            s=$1+0
+                            if (s>=0.5) print "#C41E3A"
+                            else if (s>=0.1) print "#f97316"
+                            else if (s>=0.01) print "#eab308"
+                            else print "#6b7280"
+                        }')
+                        epss_pct_fmt=$(echo "$epss_pct" | awk '{printf "%.1f%%", $1*100}' 2>/dev/null || echo "")
+                        epss_badge_html="<span class=\"badge\" style=\"background:#1a1f2e;color:${epss_color};border:1px solid #4a5568;font-size:0.75em;\">EPSS ${epss_score}${epss_pct_fmt:+ (${epss_pct_fmt})}</span>"
+                    fi
+
+                    _fixed_html=""
+                    if [ -n "$fixed_escaped" ] && [ "$fixed_escaped" != "none" ] && [ "$fixed_escaped" != "null" ]; then
+                        _fixed_html="<div><strong>Fixed Version:</strong> <code style=\"color:#68d391;\">$fixed_escaped</code></div>"
+                    else
+                        _fixed_html="<div><strong>Fixed Version:</strong> <span style=\"color:#fc8181;\">No fix available</span></div>"
+                    fi
+
+                    # Advisory URLs (beyond NVD)
+                    _adv_urls_html=""
+                    if [ -n "$adv_urls" ] && [ "$adv_urls" != "null" ]; then
+                        _adv_urls_html="<div><strong>Advisories:</strong>"
+                        for _url in $adv_urls; do
+                            _url_label=$(echo "$_url" | sed 's|https://||;s|/.*||')
+                            _adv_urls_html="${_adv_urls_html} <a href=\"${_url}\" target=\"_blank\" style=\"color:#60a5fa;font-size:0.85em;\">${_url_label}</a>"
+                        done
+                        _adv_urls_html="${_adv_urls_html}</div>"
+                    fi
+
+                    # CWE list
+                    _cwes_html=""
+                    if [ -n "$cwes_escaped" ] && [ "$cwes_escaped" != "null" ] && [ "$cwes_escaped" != "" ]; then
+                        _cwes_html="<div><strong>CWEs:</strong> <code style=\"font-size:0.85em;\">$cwes_escaped</code></div>"
+                    fi
+
+                    # Track unique container labels for the filter chips
+                    _already_tracked=false
+                    for _c in "${ANCHORE_CONTAINERS[@]:-}"; do
+                        [[ "$_c" == "$source_escaped" ]] && _already_tracked=true && break
+                    done
+                    $_already_tracked || ANCHORE_CONTAINERS+=("$source_escaped")
+
+                    ANCHORE_DETAILS="${ANCHORE_DETAILS}
+<div class=\"finding-item severity-$(echo "$severity" | tr '[:upper:]' '[:lower:]')\" data-source=\"${_source_type}\" data-container=\"${source_escaped}\" onclick=\"toggleFindingDetails(this)\">
+    <div class=\"finding-header\">
+        <span class=\"badge badge-tool\">Anchore</span>
+        <span class=\"badge ${badge_class}\">${severity}</span>
+        <span class=\"badge\" style=\"background:#2C3539;color:#9ca3af;border:1px solid #4a5568;\">${vuln_id}</span>
+        ${source_badge_html}
+        ${cvss_badge_html}
+        ${epss_badge_html}
+    </div>
+    <div class=\"finding-title\">${package_escaped} ${version_escaped}</div>
+    <div class=\"finding-desc\">${vuln_id} in package ${package_escaped} (${source_escaped})</div>
+    <div class=\"finding-details\" style=\"display:none;\">
+        <div class=\"detail-section\"><h5>Vulnerability Info</h5>
+        <div><strong>Vulnerability ID:</strong> <code>${vuln_id}</code> <a href=\"${cve_url}\" target=\"_blank\" style=\"color:#C41E3A;\">NVD ↗</a></div>
+        <div><strong>Severity:</strong> ${severity}</div>
+        $([ -n "$namespace_escaped" ] && [ "$namespace_escaped" != "null" ] && echo "<div><strong>Database:</strong> <code style=\"font-size:0.85em;\">$namespace_escaped</code></div>" || true)
+        ${_cwes_html}
+        ${_adv_urls_html}
+        </div>
+        <div class=\"detail-section\"><h5>CVSS &amp; Risk</h5>
+        $([ -n "$cvss3_score" ] && [ "$cvss3_score" != "null" ] && echo "<div><strong>CVSS v3:</strong> <span style=\"font-weight:700;color:${cvss_color:-#9ca3af};\">${cvss_float:-$cvss3_score}</span>$([ -n "$cvss3_vec" ] && [ "$cvss3_vec" != "null" ] && echo " <code style=\"font-size:0.75em;color:#9ca3af;\">$cvss3_vec</code>" || true)</div>" || true)
+        $([ -n "$cvss3_exploit" ] && [ "$cvss3_exploit" != "null" ] && echo "<div><strong>Exploitability:</strong> ${cvss3_exploit} &nbsp; <strong>Impact:</strong> ${cvss3_impact}</div>" || true)
+        $([ -n "$risk_score" ] && [ "$risk_score" != "null" ] && echo "<div><strong>Risk Score:</strong> <span style=\"color:#f97316;\">${risk_score}</span></div>" || true)
+        $([ -n "$epss_score" ] && [ "$epss_score" != "null" ] && echo "<div><strong>EPSS:</strong> <span style=\"color:${epss_color:-#9ca3af};\">${epss_score}</span>$([ -n "$epss_pct_fmt" ] && echo " <span style=\"color:#9ca3af;\">($epss_pct_fmt percentile)</span>" || true)</div>" || true)
+        </div>
+        <div class=\"detail-section\"><h5>Package Info</h5>
+        <div><strong>Package:</strong> <code>${package_escaped}</code></div>
+        <div><strong>Installed Version:</strong> <code>${version_escaped}</code></div>
+        ${_fixed_html}
+        $([ -n "$upstream_escaped" ] && [ "$upstream_escaped" != "null" ] && [ "$upstream_escaped" != "" ] && echo "<div><strong>Upstream:</strong> <code style=\"font-size:0.85em;\">$upstream_escaped</code></div>" || true)
+        $([ -n "$pkg_path_escaped" ] && [ "$pkg_path_escaped" != "null" ] && [ "$pkg_path_escaped" != "" ] && echo "<div><strong>Package Path:</strong> <code style=\"font-size:0.8em;\">$pkg_path_escaped</code></div>" || true)
+        <div><strong>Source:</strong> ${source_badge_html}</div>
+        </div>
+        <div class=\"detail-section\"><h5>Detection Details</h5>
+        $([ -n "$match_type" ] && [ "$match_type" != "null" ] && echo "<div><strong>Match Type:</strong> <code style=\"font-size:0.85em;\">$match_type</code></div>" || true)
+        $([ -n "$layer_id_short" ] && echo "<div><strong>Layer:</strong> <code style=\"font-size:0.8em;\">$layer_id_short</code></div>" || true)
+        </div>
+    </div>
+</div>"
+                fi
+            done < <(jq -r '.matches[]? |
+                (.vulnerability.cvss // [] | map(select(.version | test("^3"))) | first) as $cvss3 |
+                [
+                    .vulnerability.id,
+                    .vulnerability.severity,
+                    .artifact.name,
+                    .artifact.version,
+                    (.vulnerability.fix.versions[0] // "none"),
+                    ("https://nvd.nist.gov/vuln/detail/" + .vulnerability.id),
+                    ((.vulnerability.epss // [] | first | .epss) // "" | tostring),
+                    ((.vulnerability.epss // [] | first | .percentile) // "" | tostring),
+                    ((.vulnerability.risk // "") | tostring),
+                    (if $cvss3 then ($cvss3.metrics.baseScore // "" | tostring) else "" end),
+                    (if $cvss3 then ($cvss3.vector // "") else "" end),
+                    (if $cvss3 then ($cvss3.metrics.exploitabilityScore // "" | tostring) else "" end),
+                    (if $cvss3 then ($cvss3.metrics.impactScore // "" | tostring) else "" end),
+                    ((.vulnerability.cwes // []) | map(.cwe) | join(",")),
+                    (.vulnerability.namespace // ""),
+                    (.artifact.locations[0].layerID // ""),
+                    (.matchDetails[0].type // ""),
+                    ((.vulnerability.urls // []) | .[0:3] | join(" ")),
+                    (.artifact.upstreams[0].name // ""),
+                    (.artifact.locations[0].path // "")
+                ] | @tsv' "$anchore_file" 2>/dev/null | tr '\t' '|')
+        fi
+    done
+    
+    # Generate summary
+    if [ "$ANCHORE_TOTAL_VULNS" -gt 0 ]; then
+        # Build container filter chips dynamically from collected labels
+        ANCHORE_CONTAINER_CHIPS="<button class=\"filter-chip filter-chip-all active\" onclick=\"filterAnchoreByContainer('all', this)\">All (${ANCHORE_TOTAL_VULNS})</button>"
+        for _cname in "${ANCHORE_CONTAINERS[@]:-}"; do
+            ANCHORE_CONTAINER_CHIPS="${ANCHORE_CONTAINER_CHIPS}<button class=\"filter-chip\" onclick=\"filterAnchoreByContainer('${_cname}', this)\">${_cname}</button>"
+        done
+
+        ANCHORE_FINDINGS="<div class=\"severity-breakdown\">
+            <span class=\"severity-item\" style=\"color:#C41E3A;\">⚫ Critical: ${ANCHORE_CRITICAL}</span>
+            <span class=\"severity-item\" style=\"color:#FF1493;\">⚫ High: ${ANCHORE_HIGH}</span>
+            <span class=\"severity-item\" style=\"color:#f97316;\">⚫ Medium: ${ANCHORE_MEDIUM}</span>
+            <span class=\"severity-item\" style=\"color:#4ade80;\">⚫ Low: ${ANCHORE_LOW}</span>
+        </div>"
+
+        ANCHORE_FINDINGS="${ANCHORE_FINDINGS}<div class=\"anchore-controls\" style=\"margin:15px 0;\">
+            <div style=\"display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px;\">
+                <span style=\"font-weight:600;color:#4a5568;\">Filter by Container:</span>
+                ${ANCHORE_CONTAINER_CHIPS}
+            </div>
+            <input type=\"text\" id=\"anchore-search\" placeholder=\"🔍 Search by CVE, package, or container...\" onkeyup=\"filterAnchoreBySearch(this.value)\" style=\"width:100%;padding:10px 15px;border:2px solid #e2e8f0;border-radius:8px;font-size:0.95em;\">
+        </div>"
+        
+        ANCHORE_FINDINGS="${ANCHORE_FINDINGS}<div class=\"findings-section\" style=\"margin-top: 15px;\">
+            <h4 style=\"color: #dd6b20; margin-bottom: 10px;\">❗ Vulnerabilities Found (${ANCHORE_TOTAL_VULNS})</h4>
+            <p style=\"color:#718096;margin-bottom:15px;font-size:0.9em;\">👆 Click any finding to expand details</p>
+            ${ANCHORE_DETAILS}
+        </div>"
+    else
+        ANCHORE_FINDINGS="<p class=\"no-findings\">✅ No vulnerabilities detected</p>"
+    fi
+else
+    if [ "$_ANCHORE_TOOL_SUPPRESSED" = "true" ]; then
+        : # ANCHORE_FINDINGS already set to suppressed message above
+    elif [ "${SCAN_MODE:-full}" = "quick" ]; then
+        ANCHORE_FINDINGS="<div style='padding:20px;text-align:center;background:linear-gradient(135deg,#1a1d23 0%,#2C3539 100%);border:2px solid #6366f1;border-radius:8px;'><p style='color:#818cf8;font-size:1.1em;'>&#x23ED;&#xFE0F; <strong>Not run in quick mode</strong></p><p style='color:#9ca3af;font-size:0.9em;margin-top:8px;'>Anchore security scanning is skipped for faster PR scans. Run a full scan (push or scheduled) for complete results.</p></div>"
+    else
+        ANCHORE_FINDINGS="<p class=\"no-findings\">No Anchore results available</p>"
+    fi
+fi
+
+# ---- SonarQube Statistics ----
+SONAR_DIR="${LATEST_SCAN}/sonar"
+LATEST_SONAR=$(find "$SONAR_DIR" -name "*_sonar-analysis-results.json" -type f 2>/dev/null | sort -r | head -n 1 || echo "")
+SONAR_STATUS="N/A"
+SONAR_BUGS=0
+SONAR_VULNS=0
+SONAR_CODE_SMELLS=0
+SONAR_SECURITY_HOTSPOTS=0
+SONAR_COVERAGE="N/A"
+SONAR_DUPLICATIONS="N/A"
+SONAR_TOTAL_TESTS=0
+SONAR_PASSED_TESTS=0
+SONAR_FAILED_TESTS=0
+SONAR_SKIPPED_TESTS=0
+SONAR_HOST_URL="N/A"
+SONAR_PROJECT_KEY="N/A"
+SONAR_PROJECT_URL=""
+SONAR_RELIABILITY_RATING="N/A"
+SONAR_SECURITY_RATING="N/A"
+SONAR_MAINTAINABILITY_RATING="N/A"
+
+if [ -f "$LATEST_SONAR" ]; then
+    SONAR_STATUS=$(jq -r '.status // "NO_DATA"' "$LATEST_SONAR" 2>/dev/null || echo "NO_DATA")
+    SONAR_TOTAL_TESTS=$(jq -r '.test_results.total_tests // 0' "$LATEST_SONAR" 2>/dev/null || echo "0")
+    SONAR_PASSED_TESTS=$(jq -r '.test_results.passed_tests // 0' "$LATEST_SONAR" 2>/dev/null || echo "0")
+    SONAR_FAILED_TESTS=$(jq -r '.test_results.failed_tests // 0' "$LATEST_SONAR" 2>/dev/null || echo "0")
+    SONAR_SKIPPED_TESTS=$(jq -r '.test_results.skipped_tests // 0' "$LATEST_SONAR" 2>/dev/null || echo "0")
+    SONAR_COVERAGE=$(jq -r '.coverage.statement_coverage // "N/A"' "$LATEST_SONAR" 2>/dev/null || echo "N/A")
+    SONAR_DUPLICATIONS=$(jq -r '.coverage.duplications_percent // "N/A"' "$LATEST_SONAR" 2>/dev/null || echo "N/A")
+    SONAR_HOST_URL=$(jq -r '.host // "N/A"' "$LATEST_SONAR" 2>/dev/null || echo "N/A")
+    SONAR_PROJECT_KEY=$(jq -r '.project // "N/A"' "$LATEST_SONAR" 2>/dev/null || echo "N/A")
+    
+    # Read issues from the new structure
+    SONAR_BUGS=$(jq -r '.issues.bugs // 0' "$LATEST_SONAR" 2>/dev/null || echo "0")
+    SONAR_VULNS=$(jq -r '.issues.vulnerabilities // 0' "$LATEST_SONAR" 2>/dev/null || echo "0")
+    SONAR_CODE_SMELLS=$(jq -r '.issues.code_smells // 0' "$LATEST_SONAR" 2>/dev/null || echo "0")
+    SONAR_SECURITY_HOTSPOTS=$(jq -r '.issues.security_hotspots // 0' "$LATEST_SONAR" 2>/dev/null || echo "0")
+    
+    # Read quality ratings
+    SONAR_RELIABILITY_RATING=$(jq -r '.quality_metrics.reliability_rating // "N/A"' "$LATEST_SONAR" 2>/dev/null || echo "N/A")
+    SONAR_SECURITY_RATING=$(jq -r '.quality_metrics.security_rating // "N/A"' "$LATEST_SONAR" 2>/dev/null || echo "N/A")
+    SONAR_MAINTAINABILITY_RATING=$(jq -r '.quality_metrics.maintainability_rating // "N/A"' "$LATEST_SONAR" 2>/dev/null || echo "N/A")
+    
+    # Generate project dashboard URL (strip trailing slash to avoid //)
+    if [ "$SONAR_HOST_URL" != "N/A" ] && [ "$SONAR_PROJECT_KEY" != "N/A" ]; then
+        SONAR_PROJECT_URL="${SONAR_HOST_URL%/}/dashboard?id=${SONAR_PROJECT_KEY}"
+    fi
+    
+    if [ "$SONAR_STATUS" = "SKIPPED" ]; then
+        SONAR_SKIP_REASON=$(jq -r '.skip_reason // "Configuration not found"' "$LATEST_SONAR" 2>/dev/null || echo "Configuration not found")
+        SONAR_FINDINGS="<div class=\"stats-detail-box\" style=\"background:linear-gradient(135deg, #1a1d23 0%, #2C3539 100%);border:2px solid #f59e0b;box-shadow:0 4px 12px rgba(245, 158, 11, 0.3);\">"
+        SONAR_FINDINGS="${SONAR_FINDINGS}<h4 style=\"color:#f59e0b;margin-bottom:10px;\">⚠️ SonarQube Analysis Skipped</h4>"
+        SONAR_FINDINGS="${SONAR_FINDINGS}<p style=\"color:#fbbf24;margin:10px 0;\">Reason: ${SONAR_SKIP_REASON}</p>"
+        SONAR_FINDINGS="${SONAR_FINDINGS}<div style=\"margin-top:15px;padding:15px;background:#1f2937;border-left:4px solid #f59e0b;border-radius:4px;\">"
+        SONAR_FINDINGS="${SONAR_FINDINGS}<p style=\"margin:5px 0;color:#d1d5db;\"><strong>To enable SonarQube analysis:</strong></p>"
+        SONAR_FINDINGS="${SONAR_FINDINGS}<ol style=\"margin:10px 0;padding-left:20px;color:#d1d5db;\">"
+        SONAR_FINDINGS="${SONAR_FINDINGS}<li>Create <code>.env.sonar</code> file with authentication</li>"
+        SONAR_FINDINGS="${SONAR_FINDINGS}<li>Set <code>SONAR_HOST_URL</code> and <code>SONAR_TOKEN</code></li>"
+        SONAR_FINDINGS="${SONAR_FINDINGS}<li>Re-run the security scan</li>"
+        SONAR_FINDINGS="${SONAR_FINDINGS}</ol>"
+        SONAR_FINDINGS="${SONAR_FINDINGS}</div>"
+        SONAR_FINDINGS="${SONAR_FINDINGS}</div>"
+        SONAR_CRITICAL=0
+        SONAR_HIGH=0
+    elif [ "$SONAR_STATUS" = "NO_PROJECT_DETECTED" ]; then
+        SONAR_FINDINGS="<p class=\"no-findings\">No SonarQube project detected</p>"
+        SONAR_CRITICAL=0
+        SONAR_HIGH=0
+    else
+        SONAR_FINDINGS="<div class=\"stats-detail-box\" style=\"background:linear-gradient(135deg, #1a1d23 0%, #2C3539 100%);border:2px solid #3b82f6;box-shadow:0 4px 12px rgba(59, 130, 246, 0.3);\">"
+        
+        # Code Quality Metrics Section
+        SONAR_FINDINGS="${SONAR_FINDINGS}<h4 style=\"color:#0369a1;margin-bottom:10px;\">📊 Code Quality</h4>"
+        SONAR_FINDINGS="${SONAR_FINDINGS}<div class=\"stats-grid-small\">"
+        SONAR_FINDINGS="${SONAR_FINDINGS}<div class=\"stat-item\"><strong>🐛 Bugs:</strong> ${SONAR_BUGS}</div>"
+        SONAR_FINDINGS="${SONAR_FINDINGS}<div class=\"stat-item\"><strong>🔒 Vulnerabilities:</strong> ${SONAR_VULNS}</div>"
+        SONAR_FINDINGS="${SONAR_FINDINGS}<div class=\"stat-item\"><strong>📝 Code Smells:</strong> ${SONAR_CODE_SMELLS}</div>"
+        SONAR_FINDINGS="${SONAR_FINDINGS}<div class=\"stat-item\"><strong>🔥 Security Hotspots:</strong> ${SONAR_SECURITY_HOTSPOTS}</div>"
+        SONAR_FINDINGS="${SONAR_FINDINGS}<div class=\"stat-item\"><strong>📈 Coverage:</strong> ${SONAR_COVERAGE}</div>"
+        SONAR_FINDINGS="${SONAR_FINDINGS}<div class=\"stat-item\"><strong>📋 Duplications:</strong> ${SONAR_DUPLICATIONS}</div>"
+        SONAR_FINDINGS="${SONAR_FINDINGS}</div>"
+        
+        # Quality Ratings Section
+        SONAR_FINDINGS="${SONAR_FINDINGS}<h4 style=\"color:#0369a1;margin-bottom:10px;margin-top:15px;\">⭐ Quality Ratings</h4>"
+        SONAR_FINDINGS="${SONAR_FINDINGS}<div class=\"stats-grid-small\">"
+        SONAR_FINDINGS="${SONAR_FINDINGS}<div class=\"stat-item\"><strong>Reliability:</strong> ${SONAR_RELIABILITY_RATING}</div>"
+        SONAR_FINDINGS="${SONAR_FINDINGS}<div class=\"stat-item\"><strong>Security:</strong> ${SONAR_SECURITY_RATING}</div>"
+        SONAR_FINDINGS="${SONAR_FINDINGS}<div class=\"stat-item\"><strong>Maintainability:</strong> ${SONAR_MAINTAINABILITY_RATING}</div>"
+        SONAR_FINDINGS="${SONAR_FINDINGS}</div>"
+        
+        # Test Results Section (if available)
+        if [ "$SONAR_TOTAL_TESTS" -gt 0 ]; then
+            SONAR_FINDINGS="${SONAR_FINDINGS}<h4 style=\"color:#0369a1;margin-bottom:10px;margin-top:15px;\">🧪 Test Results</h4>"
+            SONAR_FINDINGS="${SONAR_FINDINGS}<div class=\"stats-grid-small\">"
+            SONAR_FINDINGS="${SONAR_FINDINGS}<div class=\"stat-item\"><strong>Total Tests:</strong> ${SONAR_TOTAL_TESTS}</div>"
+            SONAR_FINDINGS="${SONAR_FINDINGS}<div class=\"stat-item\"><strong>✅ Passed:</strong> ${SONAR_PASSED_TESTS}</div>"
+            SONAR_FINDINGS="${SONAR_FINDINGS}<div class=\"stat-item\"><strong>❌ Failed:</strong> ${SONAR_FAILED_TESTS}</div>"
+            SONAR_FINDINGS="${SONAR_FINDINGS}<div class=\"stat-item\"><strong>⏭️ Skipped:</strong> ${SONAR_SKIPPED_TESTS}</div>"
+            SONAR_FINDINGS="${SONAR_FINDINGS}</div>"
+        fi
+        
+        if [ -n "$SONAR_PROJECT_URL" ]; then
+            SONAR_FINDINGS="${SONAR_FINDINGS}<div style=\"margin-top:15px;padding:10px;background:white;border-radius:4px;\">"
+            SONAR_FINDINGS="${SONAR_FINDINGS}<strong>🔗 Project Dashboard:</strong><br/>"
+            SONAR_FINDINGS="${SONAR_FINDINGS}<a href=\"${SONAR_PROJECT_URL}\" target=\"_blank\" style=\"color:#0369a1;text-decoration:underline;word-break:break-all;\">${SONAR_PROJECT_URL}</a>"
+            SONAR_FINDINGS="${SONAR_FINDINGS}</div>"
+        fi
+        SONAR_FINDINGS="${SONAR_FINDINGS}</div>"
+        SONAR_FINDINGS="${SONAR_FINDINGS}<p class=\"no-findings\" style=\"margin-top:10px;\">✅ SonarQube analysis complete</p>"
+        
+        # Treat vulnerabilities as critical/high for severity counts
+        SONAR_CRITICAL=$SONAR_VULNS
+        SONAR_HIGH=$SONAR_BUGS
+    fi
+else
+    SONAR_CRITICAL=0
+    SONAR_HIGH=0
+    if [ "${SCAN_MODE:-full}" = "quick" ]; then
+        SONAR_FINDINGS="<div style='padding:20px;text-align:center;background:linear-gradient(135deg,#1a1d23 0%,#2C3539 100%);border:2px solid #6366f1;border-radius:8px;'><p style='color:#818cf8;font-size:1.1em;'>&#x23ED;&#xFE0F; <strong>Not run in quick mode</strong></p><p style='color:#9ca3af;font-size:0.9em;margin-top:8px;'>SonarQube code quality analysis is skipped for faster PR scans. Run a full scan (push or scheduled) for complete results.</p></div>"
+    else
+        SONAR_FINDINGS="<div class=\"stats-detail-box\" style=\"background:linear-gradient(135deg, #1a1d23 0%, #2C3539 100%);border:2px solid #6b7280;box-shadow:0 4px 12px rgba(107, 114, 128, 0.3);\">"
+        SONAR_FINDINGS="${SONAR_FINDINGS}<h4 style=\"color:#9ca3af;margin-bottom:10px;\">📊 SonarQube Not Configured</h4>"
+        SONAR_FINDINGS="${SONAR_FINDINGS}<p style=\"color:#d1d5db;margin:10px 0;\">No SonarQube analysis was performed for this scan.</p>"
+        SONAR_FINDINGS="${SONAR_FINDINGS}<div style=\"margin-top:15px;padding:15px;background:#1f2937;border-left:4px solid #6b7280;border-radius:4px;\">"
+        SONAR_FINDINGS="${SONAR_FINDINGS}<p style=\"margin:5px 0;color:#d1d5db;\"><strong>To enable code quality analysis:</strong></p>"
+        SONAR_FINDINGS="${SONAR_FINDINGS}<ol style=\"margin:10px 0;padding-left:20px;color:#d1d5db;\">"
+        SONAR_FINDINGS="${SONAR_FINDINGS}<li>Set up SonarQube server or use existing instance</li>"
+        SONAR_FINDINGS="${SONAR_FINDINGS}<li>Create <code>.env.sonar</code> with authentication credentials</li>"
+        SONAR_FINDINGS="${SONAR_FINDINGS}<li>Run scan to include code quality metrics</li>"
+        SONAR_FINDINGS="${SONAR_FINDINGS}</ol>"
+        SONAR_FINDINGS="${SONAR_FINDINGS}</div>"
+        SONAR_FINDINGS="${SONAR_FINDINGS}</div>"
+    fi
+fi
+
+# ---- Helm Statistics ----
+HELM_DIR="${LATEST_SCAN}/helm"
+HELM_CHARTS_SCANNED=0
+HELM_CHARTS_BUILT=0
+HELM_LINT_ERRORS=0
+HELM_LINT_WARNINGS=0
+if [ -d "$HELM_DIR" ]; then
+    # First try to read from structured JSON results file
+    HELM_RESULTS_JSON="$HELM_DIR/helm-build-results.json"
+    if [ -f "$HELM_RESULTS_JSON" ]; then
+        HELM_CHARTS_SCANNED=$(jq -r '.charts_found // 0' "$HELM_RESULTS_JSON" 2>/dev/null || echo "0")
+        HELM_CHARTS_BUILT=$(jq -r '.charts_built // 0' "$HELM_RESULTS_JSON" 2>/dev/null || echo "0")
+        HELM_LINT_ERRORS=$(jq -r '.lint_issues // 0' "$HELM_RESULTS_JSON" 2>/dev/null || echo "0")
+        HELM_LINT_WARNINGS=$(jq -r '.lint_warnings // 0' "$HELM_RESULTS_JSON" 2>/dev/null || echo "0")
+        [[ "$HELM_CHARTS_SCANNED" =~ ^[0-9]+$ ]] || HELM_CHARTS_SCANNED=0
+        [[ "$HELM_CHARTS_BUILT" =~ ^[0-9]+$ ]] || HELM_CHARTS_BUILT=0
+        [[ "$HELM_LINT_ERRORS" =~ ^[0-9]+$ ]] || HELM_LINT_ERRORS=0
+        [[ "$HELM_LINT_WARNINGS" =~ ^[0-9]+$ ]] || HELM_LINT_WARNINGS=0
+    else
+        # Fallback: Count built charts (.tgz files)
+        HELM_CHARTS_BUILT=$(find "$HELM_DIR" -name "*.tgz" -type f 2>/dev/null | wc -l | tr -d ' \n' || echo "0")
+        [[ "$HELM_CHARTS_BUILT" =~ ^[0-9]+$ ]] || HELM_CHARTS_BUILT=0
+        
+        # Fallback: Parse helm lint log for errors/warnings
+        HELM_LINT_LOG=$(find "$HELM_DIR" -name "*lint*.log" -type f 2>/dev/null | head -1)
+        if [ -f "$HELM_LINT_LOG" ]; then
+            HELM_LINT_ERRORS=$(grep -ci "error" "$HELM_LINT_LOG" 2>/dev/null || echo "0")
+            HELM_LINT_WARNINGS=$(grep -ci "warning" "$HELM_LINT_LOG" 2>/dev/null || echo "0")
+            [[ "$HELM_LINT_ERRORS" =~ ^[0-9]+$ ]] || HELM_LINT_ERRORS=0
+            [[ "$HELM_LINT_WARNINGS" =~ ^[0-9]+$ ]] || HELM_LINT_WARNINGS=0
+        fi
+        
+        # Fallback: Count charts found (from log or yaml files)
+        HELM_BUILD_LOG=$(find "$HELM_DIR" -name "*build*.log" -o -name "*.log" -type f 2>/dev/null | head -1)
+        if [ -f "$HELM_BUILD_LOG" ]; then
+            HELM_CHARTS_SCANNED=$(grep -c "Found Helm chart" "$HELM_BUILD_LOG" 2>/dev/null || echo "0")
+            [[ "$HELM_CHARTS_SCANNED" =~ ^[0-9]+$ ]] || HELM_CHARTS_SCANNED=0
+        fi
+        
+        # Fallback: If no log found, count by template yamls
+        if [ "$HELM_CHARTS_SCANNED" -eq 0 ]; then
+            HELM_CHARTS_SCANNED=$(find "$HELM_DIR" -name "*-template-output.yaml" -type f 2>/dev/null | wc -l | tr -d ' \n' || echo "0")
+            [[ "$HELM_CHARTS_SCANNED" =~ ^[0-9]+$ ]] || HELM_CHARTS_SCANNED=0
+        fi
+    fi
+fi
+HELM_CRITICAL=$HELM_LINT_ERRORS
+HELM_HIGH=$HELM_LINT_WARNINGS
+
+# Build Helm findings display
+if [ "$HELM_CHARTS_SCANNED" -gt 0 ] || [ "$HELM_CHARTS_BUILT" -gt 0 ]; then
+    HELM_FINDINGS="<div class=\"stats-grid-small\">
+        <div class=\"stat-item\"><strong>📦 Charts Found:</strong> ${HELM_CHARTS_SCANNED}</div>
+        <div class=\"stat-item\"><strong>🏗️ Charts Built:</strong> ${HELM_CHARTS_BUILT}</div>
+        <div class=\"stat-item\"><strong>❌ Lint Errors:</strong> ${HELM_LINT_ERRORS}</div>
+        <div class=\"stat-item\"><strong>⚠️ Lint Warnings:</strong> ${HELM_LINT_WARNINGS}</div>
+    </div>"
+    if [ "$HELM_LINT_ERRORS" -eq 0 ] && [ "$HELM_LINT_WARNINGS" -eq 0 ]; then
+        HELM_FINDINGS="${HELM_FINDINGS}<p style=\"margin-top: 10px; color: #38a169;\">✅ All charts passed linting</p>"
+    fi
+else
+    HELM_FINDINGS="<p class=\"no-findings\">No Helm charts found in project</p>"
+fi
+
+# ---- Xeol (EOL Detection) Statistics ----
+XEOL_DIR="${LATEST_SCAN}/xeol"
+XEOL_CRITICAL=0
+XEOL_HIGH=0
+XEOL_MEDIUM=0
+XEOL_LOW=0
+XEOL_TOTAL_EOL=0
+XEOL_IMAGES_SCANNED=0
+XEOL_FILESYSTEM_PATHS=0
+XEOL_DB_VERSION="unknown"
+XEOL_SCAN_DURATION="N/A"
+XEOL_EOL_PACKAGES=""
+XEOL_FINDINGS=""
+
+if [ -d "$XEOL_DIR" ]; then
+    # Try to read from statistics file first
+    XEOL_STATS_FILE="$XEOL_DIR/xeol-statistics.json"
+    if [ -f "$XEOL_STATS_FILE" ] && jq empty "$XEOL_STATS_FILE" 2>/dev/null; then
+        XEOL_IMAGES_SCANNED=$(jq -r '.base_images_scanned // 0' "$XEOL_STATS_FILE" 2>/dev/null || echo "0")
+        XEOL_FILESYSTEM_PATHS=$(jq -r '.filesystem_paths // 0' "$XEOL_STATS_FILE" 2>/dev/null || echo "0")
+        XEOL_TOTAL_EOL=$(jq -r '.eol_components_found // 0' "$XEOL_STATS_FILE" 2>/dev/null || echo "0")
+        XEOL_DB_VERSION=$(jq -r '.database_version // "unknown"' "$XEOL_STATS_FILE" 2>/dev/null || echo "unknown")
+        XEOL_SCAN_DURATION=$(jq -r '.scan_duration // "N/A"' "$XEOL_STATS_FILE" 2>/dev/null || echo "N/A")
+        # EOL packages is now a JSON array, convert to readable format
+        XEOL_EOL_PACKAGES=$(jq -r '.eol_packages[]? | "\(.name) \(.version)"' "$XEOL_STATS_FILE" 2>/dev/null | head -10 || echo "")
+    else
+        # Fallback: Count actual JSON files (not symlinks)
+        XEOL_IMAGES_SCANNED=$(find "$XEOL_DIR" -name "*xeol-*.json" -type f 2>/dev/null | wc -l | tr -d ' \n' || echo "0")
+        [[ "$XEOL_IMAGES_SCANNED" =~ ^[0-9]+$ ]] || XEOL_IMAGES_SCANNED=0
+        
+        for xeol_file in "$XEOL_DIR"/*xeol-*.json; do
+            if [ -f "$xeol_file" ] && [ ! -L "$xeol_file" ]; then
+                eol_count=$(jq '.matches | length' "$xeol_file" 2>/dev/null || echo "0")
+                [[ "$eol_count" =~ ^[0-9]+$ ]] || eol_count=0
+                XEOL_TOTAL_EOL=$((XEOL_TOTAL_EOL + eol_count))
+                
+                # Collect package names
+                if [ "$eol_count" -gt 0 ]; then
+                    PKG_LIST=$(jq -r '.matches[]? | "\(.artifact.name) \(.artifact.version)"' "$xeol_file" 2>/dev/null | head -5)
+                    XEOL_EOL_PACKAGES="${XEOL_EOL_PACKAGES}${PKG_LIST}\n"
+                fi
+            fi
+        done
+    fi
+    
+    [[ "$XEOL_IMAGES_SCANNED" =~ ^[0-9]+$ ]] || XEOL_IMAGES_SCANNED=0
+    [[ "$XEOL_TOTAL_EOL" =~ ^[0-9]+$ ]] || XEOL_TOTAL_EOL=0
+    
+    # Count by severity (Xeol uses "Cycle" info, treat EOL as High)
+    if [ "$XEOL_TOTAL_EOL" -gt 0 ]; then
+        XEOL_HIGH=$XEOL_TOTAL_EOL
+    fi
+    
+    # Build detailed findings display with expandable EOL components
+    if [ "$XEOL_TOTAL_EOL" -gt 0 ]; then
+        XEOL_FINDINGS="<div class=\"findings-section\" style=\"margin-top: 15px;\">
+            <h4 style=\"color: #dd6b20; margin-bottom: 10px;\">⚰️ End-of-Life Components (${XEOL_TOTAL_EOL})</h4>
+            <p style=\"color:#718096;margin-bottom:15px;font-size:0.9em;\">👆 Click on any finding below to expand details. These components are no longer receiving security updates.</p>"
+        
+        # Extract detailed EOL findings from all Xeol JSON files
+        for xeol_file in "$XEOL_DIR"/*xeol-*.json; do
+            if [ -f "$xeol_file" ] && [ ! -L "$xeol_file" ]; then
+                # Get source info (image or filesystem)
+                SOURCE_TARGET=$(jq -r '.source.target // "unknown"' "$xeol_file" 2>/dev/null || echo "unknown")
+                SOURCE_TYPE=$(jq -r '.source.type // "unknown"' "$xeol_file" 2>/dev/null || echo "unknown")
+                
+                # Determine source badge
+                if [[ "$SOURCE_TYPE" == "image" ]] || [[ "$SOURCE_TARGET" == *":"* ]]; then
+                    SOURCE_BADGE="📦 Container Image"
+                    SOURCE_LABEL="image"
+                else
+                    SOURCE_BADGE="💻 Filesystem"
+                    SOURCE_LABEL="app"
+                fi
+                
+                # Extract each EOL match as TSV for easy parsing
+                while IFS=$'\t' read -r pkg_name pkg_version pkg_type eol_date cycle_eol location_path; do
+                    if [ -n "$pkg_name" ]; then
+                        # Escape HTML entities
+                        pkg_name_escaped=$(echo "$pkg_name" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g')
+                        pkg_version_escaped=$(echo "$pkg_version" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g')
+                        location_escaped=$(echo "$location_path" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g')
+                        
+                        # Format EOL date
+                        if [ "$eol_date" != "null" ] && [ -n "$eol_date" ]; then
+                            eol_display="EOL since $eol_date"
+                            eol_badge_color="#dc2626"
+                        else
+                            eol_display="End of Life"
+                            eol_badge_color="#ea580c"
+                        fi
+                        
+                        # Create finding item
+                        XEOL_FINDINGS="${XEOL_FINDINGS}
+<div class=\"finding-item severity-high\" data-source=\"${SOURCE_LABEL}\" onclick=\"toggleFindingDetails(this)\">
+    <div class=\"finding-header\">
+        <span class=\"badge badge-tool\">Xeol</span>
+        <span class=\"badge badge-high\">HIGH</span>
+        <span class=\"badge\" style=\"background:${eol_badge_color};color:white;\">⚰️ EOL</span>
+        <span class=\"badge\" style=\"background:#152a1f;color:#4ade80;font-size:0.7em;border:1px solid #10b981;\">${SOURCE_BADGE}</span>
+    </div>
+    <div class=\"finding-title\">${pkg_name_escaped} ${pkg_version_escaped}</div>
+    <div class=\"finding-desc\">${eol_display} - No longer receiving security updates</div>
+    <div class=\"finding-details\" style=\"display:none;\">
+        <div><strong>Package Name:</strong> <code>${pkg_name_escaped}</code></div>
+        <div><strong>Version:</strong> <code>${pkg_version_escaped}</code></div>
+        <div><strong>Package Type:</strong> ${pkg_type}</div>
+        <div><strong>EOL Status:</strong> <span style=\"color:#dc2626;font-weight:bold;\">${eol_display}</span></div>
+        <div><strong>Cycle EOL:</strong> ${cycle_eol}</div>
+        <div><strong>Source:</strong> ${SOURCE_BADGE}</div>
+        <div><strong>Target:</strong> <code style=\"font-size:0.8em;word-break:break-all;\">${SOURCE_TARGET}</code></div>
+        <div><strong>Location:</strong> <code style=\"font-size:0.8em;word-break:break-all;\">${location_escaped}</code></div>
+        <div style=\"margin-top:10px;padding:10px;background:#2a1c00;border-left:3px solid #f59e0b;border-radius:4px;color:#d1d5db;\">
+            <strong style=\"color:#fbbf24;\">⚠️ Risk:</strong> This component is End-of-Life and no longer receives security patches or updates.
+            Consider upgrading to a supported version or finding an alternative package.
+            <br/><br/>
+            <strong style=\"color:#fbbf24;\">📚 Resources:</strong><br/>
+            • Check <a href=\"https://endoflife.date/${pkg_name_escaped}\" target=\"_blank\" style=\"color:#60a5fa;\">endoflife.date/${pkg_name_escaped}</a> for lifecycle information<br/>
+            • Review vendor documentation for migration paths
+        </div>
+    </div>
+</div>"
+                    fi
+                done < <(jq -r '.matches[]? | [
+                    .artifact.name // "unknown",
+                    .artifact.version // "unknown", 
+                    .artifact.type // "unknown",
+                    .eolDate // "null",
+                    .cycle.eol // "unknown",
+                    .artifact.locations[0].path // "N/A"
+                ] | @tsv' "$xeol_file" 2>/dev/null)
+            fi
+        done
+        
+        XEOL_FINDINGS="${XEOL_FINDINGS}
+        </div>"
+    else
+        XEOL_FINDINGS="<p class=\"no-findings\">✅ No end-of-life components detected</p>"
+    fi
+else
+    XEOL_FINDINGS="<p class=\"no-findings\">No Xeol data available</p>"
+fi
+
+# NOTE: Anchore Statistics section moved to line ~855 (before SonarQube)
+# This is to maintain logical ordering of security tools in the code
+
+# ---- API Discovery Statistics ----
+API_DISC_DIR="${LATEST_SCAN}"
+API_DISC_FILE="$API_DISC_DIR/api/api-discovery.json"
+API_OPENAPI_COUNT=0
+API_PYTHON_COUNT=0
+API_NODEJS_COUNT=0
+API_JAVA_COUNT=0
+API_GRAPHQL_COUNT=0
+API_DOCS_COUNT=0
+API_TOTAL_DISCOVERED=0
+API_FINDINGS=""
+API_STATUS="unknown"
+
+if [ -f "$API_DISC_FILE" ]; then
+    # Parse API discovery results - try summary fields first (new format), fallback to arrays (old format)
+    API_PYTHON_COUNT=$(jq '.summary.python_routes // ([.discovery_methods.code_routes.python[]?] | length)' "$API_DISC_FILE" 2>/dev/null || echo "0")
+    API_NODEJS_COUNT=$(jq '.summary.nodejs_routes // ([.discovery_methods.code_routes.nodejs[]?] | length)' "$API_DISC_FILE" 2>/dev/null || echo "0")
+    API_JAVA_COUNT=$(jq '.summary.java_routes // ([.discovery_methods.code_routes.java[]?] | length)' "$API_DISC_FILE" 2>/dev/null || echo "0")
+    API_OPENAPI_COUNT=$(jq '.summary.total_specs_found // ([.discovery_methods.openapi_specs[]?] | length)' "$API_DISC_FILE" 2>/dev/null || echo "0")
+    API_GRAPHQL_COUNT=$(jq '.summary.graphql_schemas // ([.discovery_methods.graphql_schemas[]?] | length)' "$API_DISC_FILE" 2>/dev/null || echo "0")
+    API_DOCS_COUNT=$(jq '.summary.documentation_patterns // ([.discovery_methods.documentation_endpoints[]?] | length)' "$API_DISC_FILE" 2>/dev/null || echo "0")
+    
+    [[ "$API_OPENAPI_COUNT" =~ ^[0-9]+$ ]] || API_OPENAPI_COUNT=0
+    [[ "$API_PYTHON_COUNT" =~ ^[0-9]+$ ]] || API_PYTHON_COUNT=0
+    [[ "$API_NODEJS_COUNT" =~ ^[0-9]+$ ]] || API_NODEJS_COUNT=0
+    [[ "$API_JAVA_COUNT" =~ ^[0-9]+$ ]] || API_JAVA_COUNT=0
+    [[ "$API_GRAPHQL_COUNT" =~ ^[0-9]+$ ]] || API_GRAPHQL_COUNT=0
+    [[ "$API_DOCS_COUNT" =~ ^[0-9]+$ ]] || API_DOCS_COUNT=0
+    
+    API_TOTAL_DISCOVERED=$((API_OPENAPI_COUNT + API_PYTHON_COUNT + API_NODEJS_COUNT + API_JAVA_COUNT + API_GRAPHQL_COUNT + API_DOCS_COUNT))
+    
+    if [ "$API_TOTAL_DISCOVERED" -gt 0 ]; then
+        API_STATUS="discovered"
+        API_FINDINGS="<div class=\"findings-section\" style=\"margin-top:15px;\">
+            <h4 style=\"color:#0369a1;margin-bottom:10px;\">🌐 Discovered APIs (${API_TOTAL_DISCOVERED})</h4>
+            <p style=\"color:#718096;margin-bottom:15px;font-size:0.9em;\">API endpoints and specifications discovered in the application. These can be targeted for security scanning with tools like OWASP ZAP and Spectral.</p>"
+        
+        # Add OpenAPI/Swagger findings
+        if [ "$API_OPENAPI_COUNT" -gt 0 ]; then
+            while IFS= read -r spec; do
+                spec_path=$(echo "$spec" | jq -r '.path' 2>/dev/null)
+                spec_type=$(echo "$spec" | jq -r '.type // "OpenAPI"' 2>/dev/null)
+                API_FINDINGS="${API_FINDINGS}<div class=\"finding-item\" style=\"border-left:4px solid #0ea5e9;\" onclick=\"toggleFindingDetails(this)\">
+    <div class=\"finding-header\">
+        <span class=\"badge\" style=\"background:#0369a1;color:white;\">📋 ${spec_type}</span>
+        <span class=\"badge\" style=\"background:#e0f2fe;color:#0369a1;\">Specification</span>
+    </div>
+    <div class=\"finding-title\">$(basename "$spec_path")</div>
+    <div class=\"finding-desc\">OpenAPI/Swagger specification file</div>
+    <div class=\"finding-details\" style=\"display:none;\">
+        <div><strong>File:</strong> <code>${spec_path}</code></div>
+        <div><strong>Type:</strong> ${spec_type}</div>
+        <div style=\"margin-top:10px;padding:10px;background:#0c1a2e;border-left:3px solid #0ea5e9;border-radius:4px;color:#d1d5db;\">
+            <strong style=\"color:#60a5fa;\">🔍 Next Steps:</strong><br/>
+            • Validate with <strong>Spectral</strong> for API security best practices<br/>
+            • Test endpoints with <strong>OWASP ZAP</strong> or <strong>Postman</strong><br/>
+            • Review authentication and authorization schemes
+        </div>
+    </div>
+</div>"
+            done < <(jq -c '.discovery_methods.openapi_specs[]?' "$API_DISC_FILE" 2>/dev/null)
+        fi
+        
+        # Add code route findings
+        if [ "$API_PYTHON_COUNT" -gt 0 ]; then
+            API_FINDINGS="${API_FINDINGS}<div class=\"finding-item\" style=\"border-left:4px solid #10b981;\" onclick=\"toggleFindingDetails(this)\">
+    <div class=\"finding-header\">
+        <span class=\"badge\" style=\"background:#059669;color:white;\">🐍 Python</span>
+        <span class=\"badge\" style=\"background:#d1fae5;color:#065f46;\">${API_PYTHON_COUNT} Routes</span>
+    </div>
+    <div class=\"finding-title\">Python API Routes (Flask/FastAPI/Django)</div>
+    <div class=\"finding-desc\">${API_PYTHON_COUNT} API routes discovered in Python code</div>
+    <div class=\"finding-details\" style=\"display:none;\">
+        <div style=\"overflow-x:auto;margin-top:10px;\">
+            <table style=\"width:100%;border-collapse:collapse;font-size:0.85em;\">
+                <thead>
+                    <tr style=\"background:#f0fdf4;border-bottom:2px solid #10b981;\">
+                        <th style=\"padding:8px;text-align:left;color:#065f46;\">Framework</th>
+                        <th style=\"padding:8px;text-align:left;color:#065f46;\">Method</th>
+                        <th style=\"padding:8px;text-align:left;color:#065f46;\">Path</th>
+                        <th style=\"padding:8px;text-align:left;color:#065f46;\">Name</th>
+                        <th style=\"padding:8px;text-align:left;color:#065f46;\">Auth</th>
+                        <th style=\"padding:8px;text-align:left;color:#065f46;\">Function</th>
+                    </tr>
+                </thead>
+                <tbody>"
+            while IFS= read -r route; do
+                framework=$(echo "$route" | jq -r '.framework // "N/A"')
+                method=$(echo "$route" | jq -r '.method // "N/A"')
+                path=$(echo "$route" | jq -r '.path // "N/A"')
+                name=$(echo "$route" | jq -r '.name // "N/A"')
+                auth=$(echo "$route" | jq -r '.auth // "None"')
+                function=$(echo "$route" | jq -r '.function // "N/A"')
+                
+                API_FINDINGS="${API_FINDINGS}<tr style=\"border-bottom:1px solid #e5e7eb;\">
+                        <td style=\"padding:8px;color:#f9fafb;font-weight:600;\">${framework}</td>
+                        <td style=\"padding:8px;\"><span class=\"badge\" style=\"background:#3b82f6;color:white;font-size:0.75em;\">${method}</span></td>
+                        <td style=\"padding:8px;color:#e5e7eb;font-family:monospace;font-size:0.8em;\">${path}</td>
+                        <td style=\"padding:8px;color:#f3f4f6;font-weight:500;\">${name}</td>
+                        <td style=\"padding:8px;color:#f3f4f6;font-weight:500;\">${auth}</td>
+                        <td style=\"padding:8px;color:#d1d5db;font-family:monospace;font-size:0.75em;\">${function}</td>
+                    </tr>"
+            done < <(jq -c '.discovery_methods.code_routes.python[]?' "$API_DISC_FILE" 2>/dev/null)
+            API_FINDINGS="${API_FINDINGS}</tbody>
+            </table>
+        </div>
+    </div>
+</div>"
+        fi
+        
+        if [ "$API_NODEJS_COUNT" -gt 0 ]; then
+            API_FINDINGS="${API_FINDINGS}<div class=\"finding-item\" style=\"border-left:4px solid #f59e0b;\" onclick=\"toggleFindingDetails(this)\">
+    <div class=\"finding-header\">
+        <span class=\"badge\" style=\"background:#d97706;color:white;\">📦 Node.js</span>
+        <span class=\"badge\" style=\"background:#fef3c7;color:#92400e;\">${API_NODEJS_COUNT} Routes</span>
+    </div>
+    <div class=\"finding-title\">Node.js API Routes (Express/Fastify/Koa/Next.js)</div>
+    <div class=\"finding-desc\">${API_NODEJS_COUNT} API routes discovered in Node.js code</div>
+    <div class=\"finding-details\" style=\"display:none;\">
+        <div style=\"overflow-x:auto;margin-top:10px;\">
+            <table style=\"width:100%;border-collapse:collapse;font-size:0.85em;\">
+                <thead>
+                    <tr style=\"background:#fffbeb;border-bottom:2px solid #f59e0b;\">
+                        <th style=\"padding:8px;text-align:left;color:#92400e;\">Framework</th>
+                        <th style=\"padding:8px;text-align:left;color:#92400e;\">Method</th>
+                        <th style=\"padding:8px;text-align:left;color:#92400e;\">Path</th>
+                        <th style=\"padding:8px;text-align:left;color:#92400e;\">Name</th>
+                        <th style=\"padding:8px;text-align:left;color:#92400e;\">Auth</th>
+                        <th style=\"padding:8px;text-align:left;color:#92400e;\">File</th>
+                    </tr>
+                </thead>
+                <tbody>"
+            while IFS= read -r route; do
+                framework=$(echo "$route" | jq -r '.framework // "N/A"')
+                method=$(echo "$route" | jq -r '.method // "N/A"')
+                path=$(echo "$route" | jq -r '.path // "N/A"')
+                name=$(echo "$route" | jq -r '.name // "N/A"')
+                auth=$(echo "$route" | jq -r '.auth // "None"')
+                file=$(echo "$route" | jq -r '.file // "N/A"')
+                
+                API_FINDINGS="${API_FINDINGS}<tr style=\"border-bottom:1px solid #e5e7eb;\">
+                        <td style=\"padding:8px;color:#f9fafb;font-weight:600;\">${framework}</td>
+                        <td style=\"padding:8px;\"><span class=\"badge\" style=\"background:#3b82f6;color:white;font-size:0.75em;\">${method}</span></td>
+                        <td style=\"padding:8px;color:#e5e7eb;font-family:monospace;font-size:0.8em;\">${path}</td>
+                        <td style=\"padding:8px;color:#f3f4f6;font-weight:500;\">${name}</td>
+                        <td style=\"padding:8px;color:#f3f4f6;font-weight:500;\">${auth}</td>
+                        <td style=\"padding:8px;color:#d1d5db;font-family:monospace;font-size:0.75em;\">${file}</td>
+                    </tr>"
+            done < <(jq -c '.discovery_methods.code_routes.nodejs[]?' "$API_DISC_FILE" 2>/dev/null)
+            API_FINDINGS="${API_FINDINGS}</tbody>
+            </table>
+        </div>
+    </div>
+</div>"
+        fi
+        
+        if [ "$API_JAVA_COUNT" -gt 0 ]; then
+            API_FINDINGS="${API_FINDINGS}<div class=\"finding-item\" style=\"border-left:4px solid #dc2626;\" onclick=\"toggleFindingDetails(this)\">
+    <div class=\"finding-header\">
+        <span class=\"badge\" style=\"background:#b91c1c;color:white;\">☕ Java</span>
+        <span class=\"badge\" style=\"background:#fee2e2;color:#991b1b;\">${API_JAVA_COUNT} Endpoints</span>
+    </div>
+    <div class=\"finding-title\">Java API Endpoints (Spring Boot/JAX-RS)</div>
+    <div class=\"finding-desc\">${API_JAVA_COUNT} API endpoints discovered in Java code</div>
+    <div class=\"finding-details\" style=\"display:none;\">
+        <div style=\"overflow-x:auto;margin-top:10px;\">
+            <table style=\"width:100%;border-collapse:collapse;font-size:0.85em;\">
+                <thead>
+                    <tr style=\"background:#fef2f2;border-bottom:2px solid #dc2626;\">
+                        <th style=\"padding:8px;text-align:left;color:#991b1b;\">Framework</th>
+                        <th style=\"padding:8px;text-align:left;color:#991b1b;\">Method</th>
+                        <th style=\"padding:8px;text-align:left;color:#991b1b;\">Path</th>
+                        <th style=\"padding:8px;text-align:left;color:#991b1b;\">Name</th>
+                        <th style=\"padding:8px;text-align:left;color:#991b1b;\">Auth</th>
+                        <th style=\"padding:8px;text-align:left;color:#991b1b;\">Class</th>
+                    </tr>
+                </thead>
+                <tbody>"
+            while IFS= read -r route; do
+                framework=$(echo "$route" | jq -r '.framework // "N/A"')
+                method=$(echo "$route" | jq -r '.method // "N/A"')
+                path=$(echo "$route" | jq -r '.path // "N/A"')
+                name=$(echo "$route" | jq -r '.name // "N/A"')
+                auth=$(echo "$route" | jq -r '.auth // "None"')
+                class=$(echo "$route" | jq -r '.class // "N/A"')
+                
+                API_FINDINGS="${API_FINDINGS}<tr style=\"border-bottom:1px solid #e5e7eb;\">
+                        <td style=\"padding:8px;color:#f9fafb;font-weight:600;\">${framework}</td>
+                        <td style=\"padding:8px;\"><span class=\"badge\" style=\"background:#3b82f6;color:white;font-size:0.75em;\">${method}</span></td>
+                        <td style=\"padding:8px;color:#e5e7eb;font-family:monospace;font-size:0.8em;\">${path}</td>
+                        <td style=\"padding:8px;color:#f3f4f6;font-weight:500;\">${name}</td>
+                        <td style=\"padding:8px;color:#f3f4f6;font-weight:500;\">${auth}</td>
+                        <td style=\"padding:8px;color:#d1d5db;font-family:monospace;font-size:0.75em;\">${class}</td>
+                    </tr>"
+            done < <(jq -c '.discovery_methods.code_routes.java[]?' "$API_DISC_FILE" 2>/dev/null)
+            API_FINDINGS="${API_FINDINGS}</tbody>
+            </table>
+        </div>
+    </div>
+</div>"
+        fi
+        
+        if [ "$API_GRAPHQL_COUNT" -gt 0 ]; then
+            API_FINDINGS="${API_FINDINGS}<div class=\"finding-item\" style=\"border-left:4px solid #8b5cf6;\">
+    <div class=\"finding-header\">
+        <span class=\"badge\" style=\"background:#7c3aed;color:white;\">🔷 GraphQL</span>
+        <span class=\"badge\" style=\"background:#ede9fe;color:#5b21b6;\">${API_GRAPHQL_COUNT} Schemas</span>
+    </div>
+    <div class=\"finding-title\">GraphQL Schemas</div>
+    <div class=\"finding-desc\">${API_GRAPHQL_COUNT} GraphQL schema files discovered</div>
+</div>"
+        fi
+        
+        API_FINDINGS="${API_FINDINGS}</div>"
+    else
+        API_STATUS="none"
+        API_FINDINGS="<p class=\"no-findings\">No APIs discovered in target directory</p>
+<div style=\"margin-top:15px;padding:15px;background:#0c1a2e;border-radius:8px;border-left:4px solid #4299e1;color:#d1d5db;\">
+    <h5 style=\"color:#60a5fa;margin-top:0;\">💡 About API Discovery</h5>
+    <p style=\"color:#9ca3af;margin:8px 0;font-size:0.9em;\">
+        This tool searches for API specifications and route definitions in your code.
+        It looks for:
+    </p>
+    <ul style=\"color:#9ca3af;margin:8px 0;padding-left:20px;font-size:0.9em;\">
+        <li><strong style=\"color:#d1d5db;\">OpenAPI/Swagger</strong> - Specification files (JSON/YAML)</li>
+        <li><strong style=\"color:#d1d5db;\">REST APIs</strong> - Python (Flask/FastAPI/Django), Node.js (Express), Java (Spring Boot)</li>
+        <li><strong style=\"color:#d1d5db;\">GraphQL</strong> - Schema definitions and resolvers</li>
+        <li><strong style=\"color:#d1d5db;\">API Documentation</strong> - Postman collections, API.md files</li>
+    </ul>
+    <p style=\"color:#6b7280;margin:8px 0;font-size:0.85em;\">
+        <em>No APIs were found in this scan. If your application has APIs, they may use non-standard patterns.</em>
+    </p>
+</div>"
+    fi
+else
+    API_STATUS="not_run"
+    API_FINDINGS="<p class=\"no-findings\">API discovery not run for this scan</p>
+<div style=\"margin-top:15px;padding:15px;background:#2a1c00;border-radius:8px;border-left:4px solid #f59e0b;color:#d1d5db;\">
+    <h5 style=\"color:#fbbf24;margin-top:0;\">⚠️ API Discovery Not Enabled</h5>
+    <p style=\"color:#9ca3af;margin:8px 0;font-size:0.9em;\">
+        Run API discovery to identify REST APIs, GraphQL endpoints, and OpenAPI specifications:
+    </p>
+    <pre style=\"background:#1a1200;color:#fcd34d;padding:10px;border-radius:4px;font-size:0.85em;margin:10px 0;\">./scripts/shell/run-api-discovery.sh /path/to/target</pre>
+    <p style=\"color:#fbbf24;margin:8px 0;font-size:0.85em;\">
+        <strong>Waypoint 6:</strong> API security scanning integration coming soon with OWASP ZAP, Spectral, and Newman.
+    </p>
+</div>"
+fi
+
+# ---- Garak (LLM Security Probing) Statistics ----
+GARAK_DIR="${LATEST_SCAN}/garak"
+GARAK_RESULT_FILE="$GARAK_DIR/garak-results.json"
+GARAK_STATUS="not_run"
+GARAK_REASON=""
+GARAK_TARGET_TYPE="N/A"
+GARAK_TARGET_NAME="N/A"
+GARAK_RUNTIME_TARGET="N/A"
+GARAK_RUNTIME_CLASSIFICATION="N/A"
+GARAK_TARGET_ORIGIN="N/A"
+GARAK_PROBES="N/A"
+GARAK_EXIT_CODE="N/A"
+GARAK_REPORT_JSONL=""
+GARAK_HIT_LOG=""
+GARAK_CONSOLE_LOG=""
+GARAK_HITS=0
+GARAK_CRITICAL=0
+GARAK_HIGH=0
+GARAK_FINDINGS=""
+
+# Decode base64-looking strings when possible for more readable hit previews.
+decode_maybe_base64() {
+    local val="$1"
+    local decoded=""
+
+    if [ -z "$val" ]; then
+        echo ""
+        return
+    fi
+
+    # Heuristic: only attempt decode for longer base64-like payloads.
+    if [[ "$val" =~ ^[A-Za-z0-9+/=[:space:]]{24,}$ ]]; then
+        decoded=$(printf '%s' "$val" | tr -d '\n\r' | (base64 --decode 2>/dev/null || base64 -D 2>/dev/null) || true)
+        if [ -n "$decoded" ]; then
+            echo "$decoded"
+            return
+        fi
+    fi
+
+    echo "$val"
+}
+
+# Map a garak probe name/family to human-readable remediation guidance.
+garak_probe_remediation() {
+    local probe="$1"
+    local family
+    family=$(echo "$probe" | cut -d. -f1 | tr '[:upper:]' '[:lower:]')
+    case "$family" in
+        promptinject)
+            echo "Apply system-level prompt hardening; use input sanitization and output filtering; consider LLM firewall tooling (e.g., LlamaGuard, Rebuff). Validate that injected instructions cannot override system prompts."
+            ;;
+        dan)
+            echo "Jailbreak resistance: test persona/role-play refusal; apply RLHF-based safety training; add a policy/guardrail layer that rejects DAN-style override instructions."
+            ;;
+        encoding)
+            echo "Normalize and decode all user inputs before processing; reject or flag inputs that arrive in non-standard encodings (base64, unicode escapes, rot13). Apply allowlist encoding policies at the gateway."
+            ;;
+        malwaregen)
+            echo "Add code-generation safety filters; restrict file-write and exec capabilities in any LLM agent. Log and review all generated code before execution. Use output classifiers to detect malicious code patterns."
+            ;;
+        knownbadsignatures)
+            echo "Block known attack-pattern inputs at the gateway level; maintain and regularly update a blocklist of malicious signatures. Deploy a WAF or LLM firewall in front of the endpoint."
+            ;;
+        xss)
+            echo "Sanitize all LLM output before rendering in a browser context; enforce a strict Content Security Policy (CSP); use output-encoding libraries (e.g., DOMPurify) on any UI that renders model responses."
+            ;;
+        lmrc)
+            echo "Review the LLM Risk Cards for your model; apply supplier-recommended mitigations; add human-review gates for sensitive use-cases (medical, legal, financial). Consult NIST AI RMF and OWASP LLM Top 10."
+            ;;
+        atkgen|continuation)
+            echo "Deploy output classifiers to detect and block harmful continuations; apply topic-based content filters; monitor production outputs for adversarial completions."
+            ;;
+        replay)
+            echo "Implement timestamped request tokens or nonces to prevent replay attacks; validate that each request is fresh and has not been reused from a prior interaction."
+            ;;
+        snowball)
+            echo "Detect and interrupt runaway generation using output length limits and turn-count guards; rate-limit multi-turn context to prevent incremental jailbreak accumulation across turns."
+            ;;
+        divergence)
+            echo "Monitor for training-data regurgitation; apply differential-privacy techniques during fine-tuning; use output classifiers to detect verbatim reproduction of sensitive training content."
+            ;;
+        gcg)
+            echo "Apply adversarial-example defenses; prefer models with certified robustness; monitor for gradient-based attack patterns in inputs; consider input perturbation/detection layers."
+            ;;
+        packagehallucination)
+            echo "Always verify dependency names from LLM output against official registries before installing; use lock files; implement supply-chain scanning (e.g., socket.dev, Snyk) in CI before executing generated dependency lists."
+            ;;
+        *)
+            echo "Review the Garak probe documentation for '${probe}'; apply input validation, output filtering, and review the model system prompt for exploitable surface area. Consult OWASP LLM Top 10 for general LLM hardening guidance."
+            ;;
+    esac
+}
+
+if [ -d "$GARAK_DIR" ]; then
+    if [ ! -f "$GARAK_RESULT_FILE" ]; then
+        GARAK_RESULT_FILE=$(find "$GARAK_DIR" -maxdepth 1 -type f -name "*_garak-results.json" | head -1)
+    fi
+
+    if [ -f "$GARAK_RESULT_FILE" ] && jq empty "$GARAK_RESULT_FILE" 2>/dev/null; then
+        GARAK_STATUS=$(jq -r '.status // "unknown"' "$GARAK_RESULT_FILE" 2>/dev/null || echo "unknown")
+        GARAK_REASON=$(jq -r '.reason // ""' "$GARAK_RESULT_FILE" 2>/dev/null || echo "")
+        GARAK_TARGET_TYPE=$(jq -r '.target_type // "N/A"' "$GARAK_RESULT_FILE" 2>/dev/null || echo "N/A")
+        GARAK_TARGET_NAME=$(jq -r '.target_name // "N/A"' "$GARAK_RESULT_FILE" 2>/dev/null || echo "N/A")
+        GARAK_RUNTIME_TARGET=$(jq -r '.runtime_target // "N/A"' "$GARAK_RESULT_FILE" 2>/dev/null || echo "N/A")
+        GARAK_RUNTIME_CLASSIFICATION=$(jq -r '.runtime_classification // "N/A"' "$GARAK_RESULT_FILE" 2>/dev/null || echo "N/A")
+        GARAK_TARGET_ORIGIN=$(jq -r '.target_origin // "N/A"' "$GARAK_RESULT_FILE" 2>/dev/null || echo "N/A")
+        GARAK_PROBES=$(jq -r '.probes // "N/A"' "$GARAK_RESULT_FILE" 2>/dev/null || echo "N/A")
+        GARAK_EXIT_CODE=$(jq -r '.exit_code // "N/A"' "$GARAK_RESULT_FILE" 2>/dev/null || echo "N/A")
+        GARAK_REPORT_JSONL=$(jq -r '.report_jsonl // ""' "$GARAK_RESULT_FILE" 2>/dev/null || echo "")
+        GARAK_HIT_LOG=$(jq -r '.hit_log // ""' "$GARAK_RESULT_FILE" 2>/dev/null || echo "")
+        GARAK_CONSOLE_LOG=$(jq -r '.console_log // ""' "$GARAK_RESULT_FILE" 2>/dev/null || echo "")
+    fi
+
+    # Fallback artifact discovery if summary fields are empty.
+    if [ -z "$GARAK_HIT_LOG" ] || [ "$GARAK_HIT_LOG" = "null" ]; then
+        GARAK_HIT_LOG=$(find "$GARAK_DIR" -maxdepth 1 -type f -name "*.hitlog.jsonl" | head -1)
+    else
+        GARAK_HIT_LOG="$GARAK_DIR/$GARAK_HIT_LOG"
+    fi
+
+    if [ -z "$GARAK_REPORT_JSONL" ] || [ "$GARAK_REPORT_JSONL" = "null" ]; then
+        GARAK_REPORT_JSONL=$(find "$GARAK_DIR" -maxdepth 1 -type f -name "*.jsonl" ! -name "*.hitlog.jsonl" | head -1)
+    else
+        GARAK_REPORT_JSONL="$GARAK_DIR/$GARAK_REPORT_JSONL"
+    fi
+
+    if [ -n "$GARAK_HIT_LOG" ] && [ -f "$GARAK_HIT_LOG" ]; then
+        GARAK_HITS=$(grep -c '.' "$GARAK_HIT_LOG" 2>/dev/null || echo "0")
+        [[ "$GARAK_HITS" =~ ^[0-9]+$ ]] || GARAK_HITS=0
+    fi
+
+    # Treat hit count as high-priority LLM safety findings for dashboard severity fallback.
+    GARAK_HIGH=$GARAK_HITS
+
+    if [ "$GARAK_HITS" -gt 0 ] && [ -f "$GARAK_HIT_LOG" ]; then
+        GARAK_TMPDIR=$(mktemp -d)
+        while IFS= read -r hit_line; do
+            [ -z "$hit_line" ] && continue
+
+            GARAK_PROBE_NAME=$(echo "$hit_line" | jq -r '.probe // .attempt.probe // .plugin_name // "unknown"' 2>/dev/null || echo "unknown")
+            GARAK_DETECTOR_NAME=$(echo "$hit_line" | jq -r '.detector // .attempt.detector // .detector_name // "unknown"' 2>/dev/null || echo "unknown")
+            GARAK_REMEDIATION_TEXT=$(garak_probe_remediation "$GARAK_PROBE_NAME")
+
+            # Derive a safe filename from the first dot-component (probe family).
+            GARAK_PROBE_FAMILY=$(echo "$GARAK_PROBE_NAME" | cut -d'.' -f1 | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_-')
+            [ -z "$GARAK_PROBE_FAMILY" ] && GARAK_PROBE_FAMILY="unknown"
+
+            # Full classname used as sub-accordion key within the family.
+            GARAK_PROBE_CLASSNAME=$(echo "$GARAK_PROBE_NAME" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9._-')
+            [ -z "$GARAK_PROBE_CLASSNAME" ] && GARAK_PROBE_CLASSNAME="unknown"
+            mkdir -p "${GARAK_TMPDIR}/${GARAK_PROBE_FAMILY}"
+
+            GARAK_PROMPT_RAW=$(echo "$hit_line" | jq -r '.prompt // .attempt.prompt // .attempt.input // .input // .goal // .trigger // empty' 2>/dev/null || echo "")
+            GARAK_RESPONSE_RAW=$(echo "$hit_line" | jq -r '.response // .output // .attempt.output // .attempt.response // .result // .attempt.result // empty' 2>/dev/null || echo "")
+
+            # Optional encoded fields seen in some plugin outputs.
+            if [ -z "$GARAK_PROMPT_RAW" ]; then
+                GARAK_PROMPT_RAW=$(echo "$hit_line" | jq -r '.prompt_b64 // .attempt.prompt_b64 // empty' 2>/dev/null || echo "")
+            fi
+            if [ -z "$GARAK_RESPONSE_RAW" ]; then
+                GARAK_RESPONSE_RAW=$(echo "$hit_line" | jq -r '.response_b64 // .attempt.response_b64 // empty' 2>/dev/null || echo "")
+            fi
+
+            GARAK_PROMPT_TEXT=$(decode_maybe_base64 "$GARAK_PROMPT_RAW")
+            GARAK_RESPONSE_TEXT=$(decode_maybe_base64 "$GARAK_RESPONSE_RAW")
+
+            GARAK_PROMPT_SAFE=$(echo "$GARAK_PROMPT_TEXT" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
+            GARAK_RESPONSE_SAFE=$(echo "$GARAK_RESPONSE_TEXT" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
+            GARAK_RAW_SAFE=$(echo "$hit_line" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
+
+            GARAK_DETAILS_HTML="<div><strong>Probe:</strong> <code>${GARAK_PROBE_NAME}</code></div><div><strong>Detector:</strong> <code>${GARAK_DETECTOR_NAME}</code></div>"
+            if [ -n "$GARAK_PROMPT_SAFE" ]; then
+                GARAK_DETAILS_HTML="${GARAK_DETAILS_HTML}<div style=\"margin-top:6px;\"><strong>Decoded Prompt:</strong></div><code style=\"display:block;white-space:pre-wrap;word-break:break-word;\">${GARAK_PROMPT_SAFE}</code>"
+            fi
+            if [ -n "$GARAK_RESPONSE_SAFE" ]; then
+                GARAK_DETAILS_HTML="${GARAK_DETAILS_HTML}<div style=\"margin-top:6px;\"><strong>Decoded Response:</strong></div><code style=\"display:block;white-space:pre-wrap;word-break:break-word;\">${GARAK_RESPONSE_SAFE}</code>"
+            fi
+            GARAK_DETAILS_HTML="${GARAK_DETAILS_HTML}<div style=\"margin-top:6px;\"><strong>Raw Hit JSON:</strong></div><code style=\"display:block;white-space:pre-wrap;word-break:break-word;\">${GARAK_RAW_SAFE}</code>"
+            GARAK_DETAILS_HTML="${GARAK_DETAILS_HTML}<div style=\"margin-top:10px;padding:8px 10px;background:#0f2a1f;border-left:3px solid #10b981;border-radius:4px;\"><span style=\"color:#4ade80;font-weight:600;\">&#x1F6E1;&#xFE0F; Remediation Guidance</span><div style=\"margin-top:4px;color:#d1fae5;font-size:0.88em;\">${GARAK_REMEDIATION_TEXT}</div></div>"
+
+            GARAK_CARD_HTML="<div class=\"finding-item severity-high\" data-source=\"app\" onclick=\"toggleFindingDetails(this)\">\
+<div class=\"finding-header\">\
+<span class=\"badge badge-tool\">Garak</span>\
+<span class=\"badge badge-high\">HIT</span>\
+<span class=\"badge\" style=\"background:#2C3539;color:#9ca3af;border:1px solid #4a5568;\">LLM Probe</span>\
+<span class=\"badge\" style=\"background:#152a1f;color:#4ade80;font-size:0.7em;border:1px solid #10b981;\">🤖 LLM</span>\
+</div>\
+<div class=\"finding-title\">Potential LLM vulnerability behavior detected</div>\
+<div class=\"finding-desc\">A garak probe produced a hit. Decoded prompt/response fields are shown when available.</div>\
+<div class=\"finding-details\" style=\"display:none;\">\
+${GARAK_DETAILS_HTML}\
+</div>\
+</div>"
+
+            # Append card to per-classname file inside the family subdirectory.
+            printf '%s' "$GARAK_CARD_HTML" >> "${GARAK_TMPDIR}/${GARAK_PROBE_FAMILY}/${GARAK_PROBE_CLASSNAME}"
+        done < "$GARAK_HIT_LOG"
+
+        # Build two-level accordion: family (outer) → classname (inner).
+        GARAK_HIT_PREVIEW=""
+        for family_dir in $(ls -1d "${GARAK_TMPDIR}"/*/  2>/dev/null | sort); do
+            family=$(basename "$family_dir")
+            GARAK_FAM_COUNT=$(grep -roh 'class="finding-item severity-high"' "${family_dir}" 2>/dev/null | wc -l | tr -d ' ')
+            [ -z "$GARAK_FAM_COUNT" ] || [ "$GARAK_FAM_COUNT" -eq 0 ] 2>/dev/null && GARAK_FAM_COUNT=0
+            GARAK_FAM_PLURAL=$([ "${GARAK_FAM_COUNT}" -gt 1 ] && echo "hits" || echo "hit")
+            GARAK_FAM_REMEDIATION=$(garak_probe_remediation "$family")
+            GARAK_FAM_REMEDIATION_SAFE=$(printf '%s' "$GARAK_FAM_REMEDIATION" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
+
+            # Inner sub-accordions: one per full classname.
+            INNER_HTML=""
+            for class_file in $(ls -1 "${family_dir}" 2>/dev/null | sort); do
+                CLASS_COUNT=$(grep -oh 'class="finding-item severity-high"' "${family_dir}${class_file}" 2>/dev/null | wc -l | tr -d ' ')
+                [ -z "$CLASS_COUNT" ] || [ "$CLASS_COUNT" -eq 0 ] 2>/dev/null && CLASS_COUNT=0
+                CLASS_PLURAL=$([ "${CLASS_COUNT}" -gt 1 ] && echo "hits" || echo "hit")
+                CLASS_CARDS=$(cat "${family_dir}${class_file}")
+                INNER_HTML="${INNER_HTML}<details class=\"garak-probe-group\" style=\"margin-left:16px;margin-top:4px;\"><summary class=\"garak-probe-summary\"><span class=\"garak-probe-arrow\">&#9654;</span><span class=\"garak-probe-family-name\" style=\"font-size:0.9em;\">${class_file}</span><span class=\"badge badge-high\" style=\"margin-left:10px;font-size:0.72em;vertical-align:middle;\">${CLASS_COUNT} ${CLASS_PLURAL}</span></summary><div class=\"garak-probe-body\">${CLASS_CARDS}</div></details>"
+            done
+
+            GARAK_HIT_PREVIEW="${GARAK_HIT_PREVIEW}<details class=\"garak-probe-group\"><summary class=\"garak-probe-summary\"><span class=\"garak-probe-arrow\">&#9654;</span><span class=\"garak-probe-family-name\">${family}</span><span class=\"badge badge-high\" style=\"margin-left:10px;font-size:0.78em;vertical-align:middle;\">${GARAK_FAM_COUNT} ${GARAK_FAM_PLURAL}</span><span class=\"garak-probe-remediation-hint\">&#x1F6E1;&#xFE0F; ${GARAK_FAM_REMEDIATION_SAFE}</span></summary><div class=\"garak-probe-body\">${INNER_HTML}</div></details>"
+        done
+        rm -rf "$GARAK_TMPDIR"
+
+        GARAK_FINDINGS="<p style=\"color:#9ca3af;margin-bottom:15px;font-size:0.9em;\">&#x1F446; Click a probe family to expand, then click a finding for details (${GARAK_HITS} hits total)</p>${GARAK_HIT_PREVIEW}"
+    elif [ "$GARAK_STATUS" = "success" ]; then
+        GARAK_FINDINGS="<p class=\"no-findings\">✅ No garak hit log findings detected</p>"
+    elif [ "$GARAK_STATUS" = "failed" ]; then
+        GARAK_FINDINGS="<p class=\"no-findings\">⚠️ Garak run failed. Review console log for details.</p>"
+    elif [ "$GARAK_STATUS" = "skipped" ]; then
+        GARAK_FINDINGS="<p class=\"no-findings\">⏭️ Garak scan was skipped for this run.</p>"
+    else
+        GARAK_FINDINGS="<p class=\"no-findings\">No garak scan data available</p>"
+    fi
+else
+    GARAK_FINDINGS="<p class=\"no-findings\">No garak scan data available</p>"
+fi
+
+# Calculate totals - Use deduplicated summary if available
+FINDINGS_SUMMARY="$LATEST_SCAN/security-findings-summary.json"
+if [ -f "$FINDINGS_SUMMARY" ]; then
+    echo -e "${CYAN}📊 Using deduplicated counts from security-findings-summary.json${NC}"
+    TOTAL_CRITICAL=$(jq -r '.summary.total_critical // 0' "$FINDINGS_SUMMARY")
+    TOTAL_HIGH=$(jq -r '.summary.total_high // 0' "$FINDINGS_SUMMARY")
+    TOTAL_MEDIUM=$(jq -r '.summary.total_medium // 0' "$FINDINGS_SUMMARY")
+    TOTAL_LOW=$(jq -r '.summary.total_low // 0' "$FINDINGS_SUMMARY")
+    TOTAL_FINDINGS=$((TOTAL_CRITICAL + TOTAL_HIGH + TOTAL_MEDIUM + TOTAL_LOW))
+    echo -e "${GREEN}✅ Using unique vulnerability counts: Critical($TOTAL_CRITICAL) High($TOTAL_HIGH) Medium($TOTAL_MEDIUM) Low($TOTAL_LOW)${NC}"
+else
+    echo -e "${YELLOW}⚠️  Deduplicated summary not found, using tool sums (may include duplicates)${NC}"
+    TOTAL_CRITICAL=$((TH_CRITICAL + CLAMAV_CRITICAL + TRIVY_CRITICAL + GRYPE_CRITICAL + SONAR_CRITICAL + CHECKOV_CRITICAL + HELM_CRITICAL + XEOL_CRITICAL + ANCHORE_CRITICAL + GARAK_CRITICAL))
+    TOTAL_HIGH=$((TRIVY_HIGH + GRYPE_HIGH + SONAR_HIGH + CHECKOV_HIGH + HELM_HIGH + XEOL_HIGH + ANCHORE_HIGH + GARAK_HIGH))
+    TOTAL_MEDIUM=$((TH_MEDIUM + TRIVY_MEDIUM + GRYPE_MEDIUM + XEOL_MEDIUM + ANCHORE_MEDIUM))
+    TOTAL_LOW=$((TRIVY_LOW + GRYPE_LOW + XEOL_LOW + ANCHORE_LOW))
+    TOTAL_FINDINGS=$((TOTAL_CRITICAL + TOTAL_HIGH + TOTAL_MEDIUM + TOTAL_LOW))
+fi
+
+# Calculate source-based totals (Container Image vs Application/Filesystem)
+# Container image vulnerabilities come from Trivy/Grype base image scans
+TOTAL_IMAGE_VULNS=$((TRIVY_CRITICAL + TRIVY_HIGH + TRIVY_MEDIUM + TRIVY_LOW + GRYPE_CRITICAL + GRYPE_HIGH + GRYPE_MEDIUM + GRYPE_LOW + XEOL_CRITICAL + XEOL_HIGH + XEOL_MEDIUM + XEOL_LOW))
+# Application/Config vulnerabilities come from Checkov, TruffleHog, Helm, SonarQube
+TOTAL_APP_VULNS=$((TH_CRITICAL + TH_MEDIUM + CHECKOV_HIGH + HELM_CRITICAL + HELM_HIGH + SONAR_CRITICAL + SONAR_HIGH + GARAK_HIGH))
+
+# Read suppressed findings information
+SUPPRESSED_LOG="${LATEST_SCAN}/suppressed-findings.md"
+SUPPRESSED_COUNT=0
+SUPPRESSED_HTML=""
+SUPPRESSED_TABLE_ROWS=""
+
+if [[ -f "$SUPPRESSED_LOG" ]]; then
+    echo -e "${CYAN}📋 Suppressed findings file exists: $SUPPRESSED_LOG${NC}" >&2
+    echo "DEBUG: File size: $(wc -l < "$SUPPRESSED_LOG" 2>/dev/null || echo 0) lines" >&2
+    SUPPRESSED_COUNT=$(grep -c "^## Suppressed:" "$SUPPRESSED_LOG" 2>/dev/null | tr -d '[:space:]' || echo "0")
+    [[ "$SUPPRESSED_COUNT" =~ ^[0-9]+$ ]] || SUPPRESSED_COUNT=0
+    echo "DEBUG: SUPPRESSED_COUNT=$SUPPRESSED_COUNT" >&2
+    if [[ $SUPPRESSED_COUNT -gt 0 ]]; then
+        echo -e "${CYAN}📋 Found $SUPPRESSED_COUNT suppressed finding(s)${NC}"
+        echo "DEBUG: Suppressed log content:" >&2
+        cat "$SUPPRESSED_LOG" >&2
+        echo "DEBUG: End of suppressed log" >&2
+        
+        # Parse suppressed findings into HTML table rows
+        while IFS= read -r line; do
+            if [[ "$line" =~ ^##\ Suppressed:\ (.+)$ ]]; then
+                # Start of new suppressed finding entry
+                current_tool=""
+                current_type=""
+                current_value=""
+                current_reason=""
+                current_approved_by=""
+                current_severity=""
+            elif [[ "$line" =~ ^-\ \*\*Tool\*\*:\ (.+)$ ]]; then
+                current_tool="${BASH_REMATCH[1]}"
+            elif [[ "$line" =~ ^-\ \*\*Type\*\*:\ (.+)$ ]]; then
+                current_type="${BASH_REMATCH[1]}"
+            elif [[ "$line" =~ ^-\ \*\*Value\*\*:\ (.+)$ ]]; then
+                current_value="${BASH_REMATCH[1]}"
+            elif [[ "$line" =~ ^-\ \*\*Reason\*\*:\ (.+)$ ]]; then
+                current_reason="${BASH_REMATCH[1]}"
+            elif [[ "$line" =~ ^-\ \*\*Approved\ By\*\*:\ (.+)$ ]]; then
+                current_approved_by="${BASH_REMATCH[1]}"
+            elif [[ "$line" =~ ^-\ \*\*Severity\*\*:\ (.+)$ ]]; then
+                current_severity="${BASH_REMATCH[1]}"
+                # End of entry, add table row
+                echo "DEBUG: Adding row - Tool: $current_tool, Type: $current_type, Value: $current_value, Reason: $current_reason, Approved By: $current_approved_by, Severity: $current_severity" >&2
+                severity_lower=$(echo "$current_severity" | tr '[:upper:]' '[:lower:]')
+                SUPPRESSED_TABLE_ROWS+="<tr>
+                    <td><span class=\"tool-badge\">${current_tool}</span></td>
+                    <td><code style=\"background: #1a1d23; padding: 2px 6px; border-radius: 4px; color: #60a5fa; font-size: 0.85em;\">${current_type}</code></td>
+                    <td style=\"max-width: 300px; word-break: break-word;\"><code style=\"background: #1a1d23; padding: 2px 6px; border-radius: 4px; color: #e8eaed; font-size: 0.85em;\">${current_value}</code></td>
+                    <td style=\"color: #9ca3af; font-size: 0.9em;\">${current_reason}</td>
+                    <td style=\"color: #60a5fa; font-size: 0.85em;\">${current_approved_by}</td>
+                    <td><span class=\"severity-badge severity-${severity_lower}\">${current_severity}</span></td>
+                </tr>"
+            fi
+        done < "$SUPPRESSED_LOG"
+        
+        echo "DEBUG: Total rows added: $(echo "$SUPPRESSED_TABLE_ROWS" | grep -c '<tr>' || echo 0)" >&2
+        
+        # Generate HTML for suppressed findings display
+        SUPPRESSED_HTML="<div style=\"background: linear-gradient(135deg, #2a1f15 0%, #2C3539 100%); border-radius: 12px; padding: 20px; margin-bottom: 20px; border: 2px solid #fbbf24; box-shadow: 0 4px 12px rgba(251, 191, 36, 0.3);\">
+            <div style=\"display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;\">
+                <h3 style=\"color: #fbbf24; margin: 0; display: flex; align-items: center; gap: 10px; font-size: 1.4em;\">
+                    <span style=\"font-size: 1.2em;\">🔕</span> Suppressed Findings
+                    <span style=\"background: #fbbf24; color: #1a1d23; padding: 4px 12px; border-radius: 20px; font-size: 0.7em; font-weight: 700;\">$SUPPRESSED_COUNT</span>
+                </h3>
+                <button onclick=\"toggleSuppressedTable()\" style=\"background: #fbbf24; color: #1a1d23; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-weight: 600; font-size: 0.9em; transition: all 0.3s; box-shadow: 0 2px 8px rgba(251, 191, 36, 0.4);\" onmouseover=\"this.style.background='#fcd34d'\" onmouseout=\"this.style.background='#fbbf24'\">
+                    <span id=\"toggleSuppressedIcon\">▼</span> View Details
+                </button>
+            </div>
+            <div style=\"background: #1a1d23; border-radius: 8px; padding: 15px; margin-bottom: 15px;\">
+                <p style=\"color: #e8eaed; margin-bottom: 10px; font-size: 1.05em;\">
+                    <strong style=\"color: #fbbf24;\">$SUPPRESSED_COUNT finding(s)</strong> were suppressed via <code style=\"background: #2a1f15; padding: 4px 8px; border-radius: 4px; color: #fbbf24; font-weight: 600;\">.barbatos-ignore.yml</code> rules.
+                </p>
+                <p style=\"color: #9ca3af; font-size: 0.95em; margin: 0; line-height: 1.5;\">
+                    ✓ These findings have been <strong>acknowledged and accepted</strong> with documented justification and audit trail.<br/>
+                    ✓ All suppressions include approval information and can be reviewed below.
+                </p>
+            </div>
+            
+            <!-- Collapsible table -->
+            <div id=\"suppressedTable\" style=\"display: none; margin-top: 15px; overflow-x: auto; animation: slideDown 0.3s ease;\">
+                <table style=\"width: 100%; border-collapse: collapse; background: #1a1d23; border-radius: 8px; overflow: hidden;\">
+                    <thead>
+                        <tr style=\"background: #2a1f15; color: #fbbf24; text-align: left;\">
+                            <th style=\"padding: 14px; border-bottom: 2px solid #fbbf24; font-weight: 700;\">Tool</th>
+                            <th style=\"padding: 14px; border-bottom: 2px solid #fbbf24; font-weight: 700;\">Type</th>
+                            <th style=\"padding: 14px; border-bottom: 2px solid #fbbf24; font-weight: 700;\">Value</th>
+                            <th style=\"padding: 14px; border-bottom: 2px solid #fbbf24; font-weight: 700;\">Reason</th>
+                            <th style=\"padding: 14px; border-bottom: 2px solid #fbbf24; font-weight: 700;\">Approved By</th>
+                            <th style=\"padding: 14px; border-bottom: 2px solid #fbbf24; font-weight: 700;\">Severity</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        ${SUPPRESSED_TABLE_ROWS}
+                    </tbody>
+                </table>
+            </div>
+        </div>"
+    else
+        echo "DEBUG: SUPPRESSED_COUNT is 0, no findings to display" >&2
+    fi
+else
+    echo "DEBUG: Suppressed findings file does not exist: $SUPPRESSED_LOG" >&2
+fi
+
+# Create output directory
+mkdir -p "$OUTPUT_DIR"
+
+# Generate the dashboard HTML
+cat > "$OUTPUT_HTML" << 'EOF'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BARBATOS - Absolute Security Control</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        
+        body { 
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: linear-gradient(135deg, #1a1d23 0%, #2C3539 50%, #1a1d23 100%);
+            min-height: 100vh;
+            padding: 20px;
+            color: #e8eaed;
+        }
+        
+        .container {
+            max-width: 1600px;
+            margin: 0 auto;
+        }
+        
+        .header {
+            background: linear-gradient(135deg, #0f1419 0%, #1a1d23 100%);
+            border-radius: 16px;
+            padding: 40px;
+            margin-bottom: 30px;
+            box-shadow: 0 10px 40px rgba(196, 30, 58, 0.4);
+            text-align: center;
+            border: 2px solid #C41E3A;
+        }
+        
+        .header h1 {
+            font-size: 2.8em;
+            margin-bottom: 10px;
+            background: linear-gradient(135deg, #C41E3A 0%, #FF1493 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            font-weight: 700;
+            letter-spacing: 2px;
+        }
+        
+        .header .subtitle {
+            color: #9ca3af;
+            font-size: 1.1em;
+            margin-top: 10px;
+            font-weight: 500;
+        }
+        
+        .alert-banner {
+            background: linear-gradient(135deg, #C41E3A 0%, #8B0000 100%);
+            color: white;
+            padding: 25px;
+            border-radius: 12px;
+            margin-bottom: 30px;
+            box-shadow: 0 4px 20px rgba(196, 30, 58, 0.5);
+            text-align: center;
+            animation: pulse 2s infinite;
+            border: 1px solid #FF1493;
+        }
+        
+        @keyframes pulse {
+            0%, 100% { transform: scale(1); }
+            50% { transform: scale(1.02); }
+        }
+        
+        .alert-banner h2 {
+            font-size: 1.8em;
+            margin-bottom: 10px;
+        }
+        
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        
+        .stat-card {
+            background: linear-gradient(135deg, #1a1d23 0%, #2C3539 100%);
+            border-radius: 12px;
+            padding: 30px;
+            text-align: center;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+            transition: all 0.3s ease;
+            cursor: pointer;
+            border: 1px solid #4a5568;
+        }
+        
+        .stat-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 8px 30px rgba(196, 30, 58, 0.4);
+            border-color: #C41E3A;
+        }
+        
+        .stat-number {
+            font-size: 3em;
+            font-weight: bold;
+            margin: 15px 0;
+        }
+        
+        .stat-label {
+            color: #9ca3af;
+            font-size: 0.9em;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            font-weight: 600;
+        }
+        
+        .critical-stat { color: #C41E3A; border-top: 4px solid #C41E3A; }
+        .high-stat { color: #FF1493; border-top: 4px solid #FF1493; }
+        .medium-stat { color: #f97316; border-top: 4px solid #f97316; }
+        .low-stat { color: #4ade80; border-top: 4px solid #4ade80; }
+        
+        .tools-section {
+            display: grid;
+            gap: 20px;
+        }
+        
+        .tool-card {
+            background: #1a1d23;
+            border-radius: 12px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+            overflow: hidden;
+            transition: all 0.3s ease;
+            border: 1px solid #2C3539;
+        }
+        
+        .tool-header {
+            padding: 25px;
+            cursor: pointer;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            background: linear-gradient(135deg, #2C3539 0%, #1a1d23 100%);
+            border-bottom: 2px solid #4a5568;
+            transition: all 0.3s ease;
+            color: #e8eaed;
+        }
+        
+        .tool-header:hover {
+            background: linear-gradient(135deg, #3a4148 0%, #2C3539 100%);
+            border-bottom-color: #C41E3A;
+        }
+        
+        .tool-header.active {
+            background: linear-gradient(135deg, #C41E3A 0%, #8B0000 100%);
+            color: white;
+            border-bottom-color: #FF1493;
+        }
+        
+        .tool-title {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            font-size: 1.4em;
+            font-weight: 600;
+        }
+        
+        .tool-icon {
+            font-size: 1.5em;
+        }
+        
+        .tool-stats {
+            display: flex;
+            gap: 15px;
+            align-items: center;
+        }
+        
+        .tool-stat-badge {
+            padding: 8px 16px;
+            border-radius: 20px;
+            font-size: 0.9em;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 5px;
+        }
+        
+        .badge-critical { background: #fed7d7; color: #c53030; }
+        .badge-high { background: #feebc8; color: #c05621; }
+        .badge-medium { background: #2a1f15; color: #fb923c; border: 1px solid #f97316; }
+        .badge-low { background: #c6f6d5; color: #2f855a; }
+        .badge-clean { background: #c6f6d5; color: #2f855a; }
+        .badge-skipped { background: #1e1b4b; color: #818cf8; border: 1px solid #4338ca; }
+        
+        .tool-badge {
+            display: inline-block;
+            padding: 4px 10px;
+            border-radius: 6px;
+            font-size: 0.85em;
+            font-weight: 600;
+            background: #3b82f6;
+            color: white;
+        }
+        
+        .severity-badge {
+            display: inline-block;
+            padding: 4px 10px;
+            border-radius: 6px;
+            font-size: 0.85em;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+        
+        .severity-critical { background: #dc2626; color: white; }
+        .severity-high { background: #ea580c; color: white; }
+        .severity-medium { background: #f59e0b; color: #1a1d23; }
+        .severity-low { background: #10b981; color: white; }
+        
+        .tool-header.active .tool-stat-badge {
+            background: rgba(255,255,255,0.2);
+            color: white;
+        }
+        
+        .expand-icon {
+            font-size: 1.2em;
+            transition: transform 0.3s ease;
+        }
+        
+        .tool-header.active .expand-icon {
+            transform: rotate(180deg);
+        }
+        
+        .tool-content {
+            max-height: 0;
+            overflow: hidden;
+            transition: max-height 0.5s ease;
+        }
+        
+        .tool-content.active {
+            max-height: 2000px;
+            overflow-y: auto;
+        }
+        
+        .tool-findings {
+            padding: 30px;
+            background: #0f1419;
+        }
+        
+        .finding-item {
+            background: #1a1d23;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 15px;
+            border-left: 4px solid #4a5568;
+            transition: all 0.2s ease;
+            cursor: pointer;
+            border: 1px solid #2C3539;
+        }
+        
+        .finding-item:hover {
+            transform: translateX(5px);
+            box-shadow: 0 4px 12px rgba(196, 30, 58, 0.3);
+            border-color: #C41E3A;
+        }
+        
+        .finding-item.expanded {
+            transform: translateX(5px);
+            box-shadow: 0 8px 24px rgba(196, 30, 58, 0.4);
+            border-left-width: 6px;
+            background: #1f2329;
+        }
+        
+        .finding-item .finding-details {
+            margin-top: 15px;
+            padding-top: 15px;
+            border-top: 1px dashed #4a5568;
+            animation: slideDown 0.3s ease;
+        }
+        
+        @keyframes slideDown {
+            from { opacity: 0; transform: translateY(-10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        
+        .finding-item.severity-critical {
+            border-left-color: #C41E3A;
+            background: #2a1215;
+            border-color: #C41E3A;
+        }
+        
+        .finding-item.severity-high {
+            border-left-color: #FF1493;
+            background: #2a1521;
+            border-color: #FF1493;
+        }
+        
+        .finding-item.severity-medium {
+            border-left-color: #f97316;
+            background: #2a1f15;
+            border-color: #ea580c;
+        }
+        
+        .finding-item.severity-low {
+            border-left-color: #4ade80;
+            background: #1a2e1f;
+            border-color: #10b981;
+        }
+
+        /* Garak probe-family sub-accordions */
+        .garak-probe-group {
+            margin-bottom: 12px;
+            border: 1px solid #1a3a30;
+            border-radius: 8px;
+            overflow: hidden;
+        }
+        .garak-probe-summary {
+            display: flex;
+            align-items: flex-start;
+            flex-wrap: wrap;
+            gap: 6px 10px;
+            padding: 11px 16px;
+            background: #0a1f1a;
+            cursor: pointer;
+            list-style: none;
+            user-select: none;
+            border-bottom: 1px solid transparent;
+            transition: background 0.15s ease;
+        }
+        .garak-probe-summary::-webkit-details-marker { display: none; }
+        .garak-probe-summary::marker { display: none; }
+        details.garak-probe-group[open] > .garak-probe-summary {
+            border-bottom-color: #1a3a30;
+            background: #0c2820;
+        }
+        .garak-probe-arrow {
+            color: #4ade80;
+            font-size: 0.7em;
+            margin-top: 3px;
+            flex-shrink: 0;
+            transition: transform 0.2s ease;
+        }
+        details.garak-probe-group[open] > .garak-probe-summary .garak-probe-arrow {
+            transform: rotate(90deg);
+        }
+        .garak-probe-family-name {
+            font-weight: 700;
+            color: #4ade80;
+            font-size: 0.92em;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            flex-shrink: 0;
+        }
+        .garak-probe-remediation-hint {
+            font-size: 0.78em;
+            color: #6b7280;
+            flex-basis: 100%;
+            margin-top: 2px;
+            line-height: 1.5;
+        }
+        .garak-probe-body {
+            padding: 14px 16px;
+            background: #0f1419;
+        }
+        .garak-probe-body .finding-item:last-child {
+            margin-bottom: 0;
+        }
+
+        .finding-header {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 12px;
+            flex-wrap: wrap;
+        }
+        
+        .badge {
+            padding: 6px 12px;
+            border-radius: 20px;
+            font-size: 0.85em;
+            font-weight: 600;
+        }
+        
+        .badge-tool {
+            background: linear-gradient(135deg, #C41E3A 0%, #8B1328 100%);
+            color: white;
+        }
+        
+        .badge-verified {
+            background: #e53e3e;
+            color: white;
+            animation: pulse-badge 2s infinite;
+        }
+        
+        @keyframes pulse-badge {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.7; }
+        }
+        
+        .finding-title {
+            font-size: 1.1em;
+            font-weight: 600;
+            margin-bottom: 8px;
+            color: #f3f4f6;
+        }
+        
+        .finding-desc {
+            color: #d1d5db;
+            margin-bottom: 12px;
+            line-height: 1.6;
+        }
+        
+        .finding-details {
+            background: #374151;
+            padding: 15px;
+            border-radius: 6px;
+            font-size: 0.9em;
+            color: #f3f4f6;
+            cursor: text;
+            user-select: text;
+        }
+        
+        .finding-details * {
+            user-select: text;
+        }
+        
+        .finding-details::selection,
+        .finding-details *::selection {
+            background: #3b82f6;
+            color: white;
+        }
+        
+        .finding-details div {
+            margin-bottom: 8px;
+        }
+        
+        .finding-details div:last-child {
+            margin-bottom: 0;
+        }
+        
+        .finding-details code {
+            background: #1f2937;
+            color: #60a5fa;
+            padding: 3px 8px;
+            border-radius: 4px;
+            font-family: 'Monaco', 'Courier New', monospace;
+            font-size: 0.9em;
+            word-break: break-all;
+        }
+        
+        /* Detail sections for expanded findings */
+        .detail-section {
+            background: #374151;
+            border: 1px solid #4b5563;
+            border-radius: 8px;
+            padding: 15px;
+            margin-bottom: 12px;
+            color: #f3f4f6;
+        }
+        
+        .detail-section h5 {
+            color: #f9fafb;
+            margin: 0 0 12px 0;
+            font-size: 0.95em;
+            border-bottom: 1px solid #6b7280;
+            padding-bottom: 8px;
+        }
+        
+        .detail-section div {
+            margin-bottom: 6px;
+        }
+        
+        
+        /* Status badge colors */
+        .status-fixed {
+            background: #c6f6d5 !important;
+            color: #2f855a !important;
+        }
+        
+        .status-affected {
+            background: #fed7d7 !important;
+            color: #c53030 !important;
+        }
+        
+        .status-unknown {
+            background: #feebc8 !important;
+            color: #c05621 !important;
+        }
+        
+        .stats-detail-box {
+            background: linear-gradient(135deg, #1a1d23 0%, #2C3539 100%);
+            border: 1px solid #C41E3A;
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 20px;
+            box-shadow: 0 4px 12px rgba(196, 30, 58, 0.3);
+        }
+        
+        .stats-detail-box h4 {
+            color: #FF1493;
+            margin-bottom: 15px;
+            font-size: 1.1em;
+        }
+        
+        .stats-grid-small {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 12px;
+        }
+        
+        .stat-item {
+            background: #0f1419;
+            padding: 10px 15px;
+            border-radius: 8px;
+            font-size: 0.9em;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.4);
+            border: 1px solid #4a5568;
+            color: #e8eaed;
+        }
+        
+        .stat-item strong {
+            color: #60a5fa;
+        }
+        
+        .finding-summary {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            margin-bottom: 20px;
+        }
+        
+        .no-findings {
+            text-align: center;
+            padding: 40px;
+            color: #4ade80;
+            font-size: 1.2em;
+        }
+        
+        /* SBOM Viewer Styles */
+        .sbom-controls {
+            background: linear-gradient(135deg, #1a1d23 0%, #2C3539 100%);
+            border: 1px solid #3b82f6;
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+        
+        .sbom-filter-section {
+            margin-bottom: 15px;
+        }
+        
+        .sbom-filter-section .filter-label,
+        .sbom-sort-section .filter-label {
+            font-weight: 600;
+            color: #0369a1;
+            margin-right: 10px;
+            display: inline-block;
+            margin-bottom: 10px;
+        }
+        
+        .sbom-filter-chips {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+        
+        .sbom-filter-chip {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            background: #1f2937;
+            color: #7dd3fc;
+            border: 2px solid #7dd3fc;
+            border-radius: 20px;
+            padding: 6px 14px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            font-size: 0.9em;
+        }
+        
+        .sbom-filter-chip:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+            background: #374151;
+        }
+        
+        .sbom-filter-chip.active {
+            background: linear-gradient(135deg, #0369a1 0%, #0284c7 100%);
+            border-color: #0369a1;
+            color: white;
+        }
+        
+        .sbom-filter-chip.active .type-name {
+            color: white;
+        }
+        
+        .sbom-filter-chip.active .type-count {
+            background: rgba(255,255,255,0.3);
+            color: white;
+        }
+        
+        .sbom-filter-chip .type-name {
+            font-weight: 600;
+            color: #0369a1;
+        }
+        
+        .sbom-filter-chip .type-count {
+            background: #e0f2fe;
+            color: #0369a1;
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 0.85em;
+            font-weight: 600;
+        }
+        
+        .sbom-sort-section {
+            margin-bottom: 15px;
+        }
+        
+        .sbom-sort-buttons {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+        
+        .sbom-sort-btn {
+            padding: 8px 16px;
+            border-radius: 8px;
+            border: 2px solid #4b5563;
+            background: #1f2937;
+            color: #e5e7eb;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+        
+        .sbom-sort-btn:hover {
+            background: #374151;
+            border-color: #6b7280;
+        }
+        
+        .sbom-sort-btn.active {
+            background: linear-gradient(135deg, #C41E3A 0%, #8B1328 100%);
+            color: white;
+            border-color: #C41E3A;
+        }
+        
+        .sbom-results-bar {
+            background: #1f2937;
+            padding: 12px 20px;
+            border-radius: 8px;
+            margin-bottom: 15px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border: 1px solid #4b5563;
+        }
+        
+        #sbom-results-count {
+            font-weight: 600;
+            color: #f3f4f6;
+        }
+        
+        .sbom-type-breakdown {
+            margin-bottom: 20px;
+        }
+        
+        .sbom-type-breakdown h4 {
+            color: #60a5fa;
+            margin-bottom: 15px;
+        }
+        
+        .sbom-types-grid {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+        
+        .sbom-type-chip {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            background: linear-gradient(135deg, #1e3a5f 0%, #1e40af 100%);
+            border: 1px solid #3b82f6;
+            border-radius: 20px;
+            padding: 8px 16px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+        
+        .sbom-type-chip:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+        }
+        
+        .sbom-type-chip .type-name {
+            font-weight: 600;
+            color: #93c5fd;
+        }
+        
+        .sbom-type-chip .type-count {
+            background: #1e293b;
+            color: #93c5fd;
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 0.85em;
+            font-weight: 600;
+        }
+        
+        .sbom-version-badge {
+            background: #1e3a5f !important;
+            color: #93c5fd !important;
+        }
+        
+        .sbom-lang-badge {
+            background: #422006 !important;
+            color: #fcd34d !important;
+        }
+        
+        .sbom-search-box {
+            margin-top: 15px;
+        }
+        
+        .sbom-search-box input {
+            width: 100%;
+            padding: 12px 20px;
+            border: 2px solid #4b5563;
+            background: #1f2937;
+            color: #f3f4f6;
+            border-radius: 10px;
+            font-size: 1em;
+            transition: all 0.2s ease;
+        }
+        
+        .sbom-search-box input:focus {
+            outline: none;
+            border-color: #C41E3A;
+            box-shadow: 0 0 0 3px rgba(196,30,58,0.1);
+        }
+        
+        .sbom-package-list {
+            max-height: 600px;
+            overflow-y: auto;
+        }
+        
+        .sbom-package-item {
+            background: #1f2937;
+            border-radius: 8px;
+            padding: 15px 20px;
+            margin-bottom: 10px;
+            border-left: 4px solid #3b82f6;
+            border: 1px solid #374151;
+            color: #f3f4f6;
+            transition: all 0.2s ease;
+            cursor: pointer;
+        }
+        
+        .sbom-package-item:hover {
+            transform: translateX(5px);
+            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+        }
+        
+        .sbom-package-item.expanded {
+            background: #1e3a5f;
+            border-left-width: 6px;
+            border-color: #3b82f6;
+        }
+        
+        .sbom-package-item.filtered-out {
+            display: none;
+        }
+        
+        .footer {
+            background: #1a1d23;
+            border: 1px solid #4b5563;
+            border-radius: 12px;
+            padding: 30px;
+            margin-top: 30px;
+            text-align: center;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+            color: #e5e7eb;
+        }
+        
+        .footer-links {
+            display: flex;
+            gap: 20px;
+            justify-content: center;
+            margin-top: 20px;
+            flex-wrap: wrap;
+        }
+        
+        .footer-link {
+            color: #C41E3A;
+            text-decoration: none;
+            font-weight: 600;
+            transition: all 0.2s;
+        }
+        
+        .footer-link:hover {
+            color: #8B1328;
+            text-decoration: underline;
+        }
+        
+        .footer-manifest-btn {
+            background: linear-gradient(135deg, #C41E3A 0%, #8B1328 100%);
+            color: white;
+            border: none;
+            padding: 10px 22px;
+            border-radius: 8px;
+            font-weight: 600;
+            font-size: 0.95em;
+            cursor: pointer;
+            transition: all 0.2s;
+            box-shadow: 0 2px 8px rgba(196,30,58,0.4);
+            margin-top: 20px;
+        }
+        
+        .footer-manifest-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 14px rgba(196,30,58,0.6);
+        }
+        
+        .footer-manifest-btn:disabled {
+            background: linear-gradient(135deg, #4b5563 0%, #374151 100%);
+            box-shadow: none;
+            cursor: not-allowed;
+            transform: none;
+            opacity: 0.6;
+        }
+        
+        /* Scan Manifest Modal */
+        .manifest-modal-overlay {
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: rgba(0,0,0,0.75);
+            z-index: 9000;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+            overflow-y: auto;
+        }
+        
+        .manifest-modal-overlay.open {
+            display: flex;
+        }
+        
+        .manifest-modal {
+            background: #1a1d23;
+            border: 1px solid #4b5563;
+            border-radius: 14px;
+            width: 100%;
+            max-width: 860px;
+            max-height: 90vh;
+            display: flex;
+            flex-direction: column;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.6);
+            overflow: hidden;
+            position: relative;
+        }
+        
+        .manifest-modal-header {
+            background: linear-gradient(135deg, #C41E3A 0%, #8B1328 100%);
+            padding: 22px 28px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .manifest-modal-title {
+            color: white;
+            font-size: 1.3em;
+            font-weight: 700;
+            margin: 0;
+        }
+        
+        .manifest-modal-close {
+            background: rgba(255,255,255,0.2);
+            border: none;
+            color: white;
+            width: 34px;
+            height: 34px;
+            border-radius: 50%;
+            font-size: 1.2em;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: background 0.2s;
+            line-height: 1;
+        }
+        
+        .manifest-modal-close:hover {
+            background: rgba(255,255,255,0.35);
+        }
+        
+        .manifest-modal-body {
+            padding: 28px;
+            color: #e5e7eb;
+            overflow-y: auto;
+            flex: 1;
+        }
+        
+        .manifest-section {
+            margin-bottom: 24px;
+        }
+        
+        .manifest-section-title {
+            color: #C41E3A;
+            font-size: 1em;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            margin-bottom: 12px;
+            padding-bottom: 6px;
+            border-bottom: 1px solid #374151;
+        }
+        
+        .manifest-kv-grid {
+            display: grid;
+            grid-template-columns: 160px 1fr;
+            gap: 8px 12px;
+        }
+        
+        .manifest-key {
+            color: #9ca3af;
+            font-size: 0.88em;
+            font-weight: 600;
+        }
+        
+        .manifest-value {
+            color: #f3f4f6;
+            font-size: 0.88em;
+            word-break: break-all;
+            font-family: 'Courier New', monospace;
+        }
+        
+        .manifest-file-list {
+            max-height: 300px;
+            overflow-y: auto;
+            background: #111318;
+            border: 1px solid #374151;
+            border-radius: 8px;
+            padding: 12px 16px;
+        }
+        
+        .manifest-file-item {
+            display: grid;
+            grid-template-columns: 1fr auto;
+            gap: 12px;
+            padding: 6px 0;
+            border-bottom: 1px solid #1f2937;
+            font-size: 0.82em;
+        }
+
+        /* Metrics Modal */
+        .metrics-modal-overlay {
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: rgba(0,0,0,0.75);
+            z-index: 9000;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+            overflow-y: auto;
+        }
+
+        .metrics-modal-overlay.open {
+            display: flex;
+        }
+
+        .metrics-modal {
+            background: #1a1d23;
+            border: 1px solid #4b5563;
+            border-radius: 14px;
+            width: 100%;
+            max-width: 860px;
+            max-height: 90vh;
+            display: flex;
+            flex-direction: column;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.6);
+            overflow: hidden;
+            position: relative;
+        }
+
+        .metrics-modal-header {
+            background: linear-gradient(135deg, #C41E3A 0%, #8B1328 100%);
+            padding: 22px 28px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .metrics-modal-title {
+            color: white;
+            font-size: 1.3em;
+            font-weight: 700;
+            margin: 0;
+        }
+
+        .metrics-modal-close {
+            background: rgba(255,255,255,0.2);
+            border: none;
+            color: white;
+            width: 34px;
+            height: 34px;
+            border-radius: 50%;
+            font-size: 1.2em;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: background 0.2s;
+            line-height: 1;
+        }
+
+        .metrics-modal-close:hover {
+            background: rgba(255,255,255,0.35);
+        }
+
+        .metrics-modal-body {
+            padding: 28px;
+            color: #e5e7eb;
+            overflow-y: auto;
+            flex: 1;
+        }
+
+        .footer-metrics-btn {
+            background: linear-gradient(135deg, #C41E3A 0%, #8B1328 100%);
+            color: white;
+            border: none;
+            padding: 10px 22px;
+            border-radius: 8px;
+            font-weight: 600;
+            font-size: 0.95em;
+            cursor: pointer;
+            transition: all 0.2s;
+            box-shadow: 0 2px 8px rgba(196,30,58,0.4);
+            margin-top: 20px;
+            margin-right: 12px;
+        }
+
+        .footer-metrics-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 14px rgba(196,30,58,0.6);
+        }
+
+        .footer-metrics-btn:disabled {
+            background: linear-gradient(135deg, #4b5563 0%, #374151 100%);
+            box-shadow: none;
+            cursor: not-allowed;
+            transform: none;
+            opacity: 0.6;
+        }
+
+        .manifest-file-item:last-child {
+            border-bottom: none;
+        }
+        
+        .manifest-file-name {
+            color: #93c5fd;
+            word-break: break-all;
+        }
+        
+        .manifest-file-hash {
+            color: #6b7280;
+            font-family: 'Courier New', monospace;
+            white-space: nowrap;
+            font-size: 0.85em;
+        }
+        
+        .manifest-integrity-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            background: linear-gradient(135deg, #052e16 0%, #14532d 100%);
+            border: 1px solid #10b981;
+            color: #34d399;
+            padding: 6px 14px;
+            border-radius: 20px;
+            font-size: 0.85em;
+            font-weight: 600;
+            margin-bottom: 16px;
+        }
+        
+        .manifest-no-data {
+            color: #9ca3af;
+            font-style: italic;
+            font-size: 0.9em;
+        }
+        
+        /* Filter Controls */
+        .filter-bar {
+            background: linear-gradient(135deg, #1a1d23 0%, #2C3539 100%);
+            border-radius: 12px;
+            padding: 20px 30px;
+            margin-bottom: 30px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.4);
+            display: flex;
+            flex-wrap: wrap;
+            gap: 15px;
+            align-items: center;
+            border: 1px solid #4a5568;
+        }
+        
+        .filter-label {
+            font-weight: 600;
+            color: #e8eaed;
+            margin-right: 10px;
+        }
+        
+        .filter-chips {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+        
+        .filter-chip {
+            padding: 8px 16px;
+            border-radius: 25px;
+            border: 2px solid transparent;
+            font-weight: 600;
+            font-size: 0.9em;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        
+        .filter-chip:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+        }
+        
+        .filter-chip.active {
+            transform: scale(1.05);
+            box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+        }
+        
+        .filter-chip-all {
+            background: #2C3539;
+            color: #e8eaed;
+            border-color: #4a5568;
+        }
+        .filter-chip-all.active {
+            background: linear-gradient(135deg, #C41E3A 0%, #8B0000 100%);
+            color: white;
+            border-color: #FF1493;
+        }
+        
+        .filter-chip-critical {
+            background: #2a1215;
+            color: #C41E3A;
+            border-color: #C41E3A;
+        }
+        .filter-chip-critical.active {
+            background: linear-gradient(135deg, #C41E3A 0%, #8B0000 100%);
+            color: white;
+            border-color: #FF1493;
+        }
+        
+        .filter-chip-high {
+            background: #2a1521;
+            color: #FF1493;
+            border-color: #FF1493;
+        }
+        .filter-chip-high.active {
+            background: linear-gradient(135deg, #FF1493 0%, #C41E3A 100%);
+            color: white;
+            border-color: #FF69B4;
+        }
+        
+        .filter-chip-medium {
+            background: #2a1f15;
+            color: #fb923c;
+            border-color: #f97316;
+        }
+        .filter-chip-medium.active {
+            background: #f97316;
+            color: #1a1d23;
+            border-color: #fb923c;
+        }
+        
+        .filter-chip-low {
+            background: #152a1f;
+            color: #4ade80;
+            border-color: #10b981;
+        }
+        .filter-chip-low.active {
+            background: #10b981;
+            color: #1a1d23;
+            border-color: #4ade80;
+        }
+        
+        .filter-chip .chip-count {
+            background: rgba(0,0,0,0.1);
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 0.85em;
+        }
+        
+        .filter-chip.active .chip-count {
+            background: rgba(255,255,255,0.3);
+        }
+        
+        .sort-controls {
+            display: flex;
+            gap: 10px;
+            margin-left: auto;
+            align-items: center;
+        }
+        
+        .sort-btn {
+            padding: 8px 16px;
+            border-radius: 8px;
+            border: 1px solid #4a5568;
+            background: #2C3539;
+            color: #e8eaed;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        
+        .sort-btn:hover {
+            background: #3a4148;
+            border-color: #C41E3A;
+        }
+        
+        .sort-btn.active {
+            background: #C41E3A;
+            color: white;
+            border-color: #C41E3A;
+        }
+        
+        .filter-results {
+            background: #1a1d23;
+            padding: 12px 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border: 1px solid #4a5568;
+        }
+        
+        .filter-results-count {
+            font-weight: 600;
+            color: #e8eaed;
+        }
+        
+        .clear-filter {
+            color: #C41E3A;
+            text-decoration: none;
+            cursor: pointer;
+            font-weight: 500;
+        }
+        
+        .clear-filter:hover {
+            text-decoration: underline;
+        }
+        
+        .finding-item.filtered-out {
+            display: none !important;
+        }
+        
+        .tool-card.filtered-out {
+            opacity: 0.4;
+        }
+        
+        .sort-indicator {
+            font-size: 0.8em;
+            margin-left: 4px;
+            opacity: 0.3;
+            transition: opacity 0.2s ease;
+        }
+        
+        th:hover .sort-indicator {
+            opacity: 0.6;
+        }
+        
+        @media (max-width: 768px) {
+            .stats-grid {
+                grid-template-columns: repeat(2, 1fr);
+            }
+            
+            .tool-header {
+                flex-direction: column;
+                gap: 15px;
+                text-align: center;
+            }
+            
+            .tool-stats {
+                flex-wrap: wrap;
+                justify-content: center;
+            }
+        }
+
+        /* ── IOC Summary Panel ──────────────────────────── */
+        .ioc-summary {
+            background: linear-gradient(135deg, #0f1419 0%, #1a1d23 100%);
+            border: 2px solid #C41E3A;
+            border-radius: 16px;
+            padding: 28px 32px;
+            margin-bottom: 28px;
+            box-shadow: 0 4px 24px rgba(196,30,58,0.25);
+        }
+        .ioc-summary h3 {
+            color: #e8eaed;
+            font-size: 1.3em;
+            margin-bottom: 20px;
+            letter-spacing: 0.5px;
+        }
+        .ioc-body {
+            display: flex;
+            gap: 28px;
+            align-items: flex-start;
+        }
+        .ioc-grid {
+            flex: 1;
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 14px;
+            align-content: start;
+            min-width: 0;
+        }
+        .ioc-card {
+            border-radius: 12px;
+            padding: 18px 14px;
+            text-align: center;
+            border: 1px solid #4a5568;
+            background: #1a1d23;
+            transition: transform 0.25s, box-shadow 0.25s;
+        }
+        .ioc-card:hover { transform: translateY(-3px); box-shadow: 0 6px 20px rgba(0,0,0,0.45); }
+        .ioc-card.alert  { border-color: #C41E3A; background: #2a1215; }
+        .ioc-card.warning{ border-color: #f97316; background: #2a1f15; }
+        .ioc-card.clean  { border-color: #10b981; background: #1a2e1f; }
+        .ioc-card.skipped{ border-color: #6366f1; background: #1a1a2e; opacity:.85; }
+        .ioc-icon  { font-size: 1.5em; margin-bottom: 2px; }
+        .ioc-mini-total { font-size: 1.05em; font-weight: 700; color: #e8eaed; line-height: 1; }
+        .ioc-card.alert   .ioc-mini-total { color: #C41E3A; }
+        .ioc-card.warning .ioc-mini-total { color: #f97316; }
+        .ioc-card.clean   .ioc-mini-total { color: #4ade80; }
+        .ioc-card.skipped .ioc-mini-total { color: #818cf8; }
+        .ioc-mini-sub { font-size: 0.58em; color: #6b7280; letter-spacing: 0.3px; margin-top: 1px; }
+        .ioc-label  { font-size: 0.72em; text-transform: uppercase; letter-spacing: .5px; color: #9ca3af; font-weight: 600; }
+        .ioc-source { font-size: 0.68em; color: #6b7280; margin-top: 3px; }
+        canvas.ioc-mini-donut { display: block; cursor: crosshair; }
+
+        /* ── Donut Layout ────────────────────────────────── */
+        .donut-layout {
+            display: flex;
+            gap: 24px;
+            flex-wrap: wrap;
+            align-items: center;
+            margin-bottom: 30px;
+        }
+        .donut-panel {
+            flex: 0 0 auto;
+            background: linear-gradient(135deg, #1a1d23 0%, #2C3539 100%);
+            border-radius: 16px;
+            padding: 28px 24px;
+            text-align: center;
+            border: 1px solid #4a5568;
+            min-width: 230px;
+        }
+        .donut-canvas-wrap { position: relative; display: inline-block; }
+        #severity-donut { display: block; cursor: crosshair; }
+        .donut-center {
+            position: absolute; top: 50%; left: 50%;
+            transform: translate(-50%,-50%);
+            pointer-events: none; text-align: center;
+        }
+        .donut-center-count { font-size: 2em; font-weight: 700; color: #e8eaed; line-height:1; }
+        .donut-center-sub   { font-size: 0.65em; color: #9ca3af; text-transform: uppercase; letter-spacing: 1px; margin-top: 3px; }
+        .donut-legend { margin-top: 14px; display: flex; flex-direction: column; gap: 5px; text-align: left; }
+        .donut-legend-item {
+            display: flex; align-items: center; gap: 8px;
+            font-size: 0.82em; padding: 4px 8px; border-radius: 6px;
+            background: rgba(0,0,0,.2); transition: background .2s; cursor: default;
+        }
+        .donut-legend-item:hover { background: rgba(255,255,255,.05); }
+        .donut-legend-dot  { width: 11px; height: 11px; border-radius: 50%; flex-shrink: 0; }
+        .donut-legend-text { flex: 1; color: #d1d5db; }
+        .donut-legend-count{ font-weight: 700; color: #e8eaed; }
+        .donut-legend-pct  { color: #6b7280; font-size: .85em; margin-left: 4px; }
+        #donut-tooltip {
+            position: fixed; display: none;
+            background: #1a1d23; border: 1px solid #4a5568; border-radius: 8px;
+            padding: 10px 14px; font-size: .82em; pointer-events: none;
+            z-index: 9999; box-shadow: 0 4px 16px rgba(0,0,0,.55); color: #e8eaed;
+            min-width: 130px;
+        }
+        .stats-panel { flex: 1; min-width: 280px; }
+
+        /* ── Classification Banner ────────────────────────────────────── */
+        .classification-banner {
+            position: sticky;
+            top: 0;
+            z-index: 10000;
+            width: 100%;
+            text-align: center;
+            padding: 7px 16px;
+            font-family: 'Arial Narrow', Arial, sans-serif;
+            font-size: 0.88em;
+            font-weight: 700;
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+            border: none;
+            margin: 0;
+            user-select: none;
+        }
+        .classification-banner-bottom {
+            width: 100%;
+            text-align: center;
+            padding: 7px 16px;
+            font-family: 'Arial Narrow', Arial, sans-serif;
+            font-size: 0.88em;
+            font-weight: 700;
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+            margin-top: 30px;
+        }
+
+        /* ── Print: repeat classification banner on every page ── */
+        @media print {
+            .classification-banner {
+                position: fixed;
+                top: 0;
+                left: 0;
+                right: 0;
+                display: block !important;
+                print-color-adjust: exact;
+                -webkit-print-color-adjust: exact;
+            }
+            .classification-banner-bottom {
+                position: fixed;
+                bottom: 0;
+                left: 0;
+                right: 0;
+                display: block !important;
+                print-color-adjust: exact;
+                -webkit-print-color-adjust: exact;
+            }
+            body { margin-top: 2.2em; margin-bottom: 2.2em; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+EOF
+
+# Inject classification top banner (dynamic — needs variable substitution)
+if [ "${CLASS_SHOW_BANNER}" = "true" ]; then
+    cat >> "$OUTPUT_HTML" << EOF
+    <div class="classification-banner" style="background:${CLASS_BG};color:${CLASS_TEXT_COLOR};">
+        ${CLASS_LABEL}
+    </div>
+EOF
+fi
+
+# Add alert banner if critical findings exist
+if [ "$TOTAL_CRITICAL" -gt 0 ]; then
+    cat >> "$OUTPUT_HTML" << EOF
+        <div class="alert-banner">
+            <h2>⚠️ CRITICAL SECURITY ALERT</h2>
+            <p><strong>${TOTAL_CRITICAL} Critical Findings Detected</strong> - Immediate Action Required!</p>
+        </div>
+EOF
+fi
+
+# Compute IOC indicator values for the summary panel
+IOC_SECRETS=$((TH_CRITICAL + TH_MEDIUM))
+IOC_CVE_CRITICAL=$((GRYPE_CRITICAL + TRIVY_CRITICAL))
+IOC_CVE_TOTAL=$((GRYPE_CRITICAL + GRYPE_HIGH + GRYPE_MEDIUM + GRYPE_LOW + TRIVY_CRITICAL + TRIVY_HIGH + TRIVY_MEDIUM + TRIVY_LOW))
+IOC_CVE_HIGH=$((GRYPE_HIGH + TRIVY_HIGH))
+IOC_CVE_MEDIUM=$((GRYPE_MEDIUM + TRIVY_MEDIUM))
+IOC_CVE_LOW=$((GRYPE_LOW + TRIVY_LOW))
+IOC_IAC=${CHECKOV_FAILED:-0}
+IOC_CODE=$((SONAR_VULNS + SONAR_BUGS))
+IOC_EOL=$((XEOL_CRITICAL + XEOL_HIGH + XEOL_MEDIUM + XEOL_LOW))
+IOC_SUPPLY=$((ANCHORE_CRITICAL + ANCHORE_HIGH + ANCHORE_MEDIUM + ANCHORE_LOW))
+IOC_LLM=${GARAK_HITS:-0}
+# Card state helpers
+if [ "$IOC_SECRETS" -gt 0 ]; then IOC_CLASS_SECRETS="alert"; else IOC_CLASS_SECRETS="clean"; fi
+if [ "${SCAN_MODE:-full}" = "quick" ]; then
+    IOC_CLASS_MALWARE="skipped"; IOC_MALWARE_DISP="&#x23ED;"
+elif [ "${CLAMAV_INFECTED:-0}" -gt 0 ]; then
+    IOC_CLASS_MALWARE="alert"; IOC_MALWARE_DISP="${CLAMAV_INFECTED}"
+else IOC_CLASS_MALWARE="clean"; IOC_MALWARE_DISP="0"; fi
+if [ "$IOC_CVE_CRITICAL" -gt 0 ]; then IOC_CLASS_CVES="alert";
+elif [ "$IOC_CVE_TOTAL" -gt 0 ]; then IOC_CLASS_CVES="warning";
+else IOC_CLASS_CVES="clean"; fi
+if [ "${SCAN_MODE:-full}" = "quick" ]; then IOC_CLASS_IAC="skipped"; IOC_IAC_DISP="&#x23ED;";
+elif [ "$IOC_IAC" -gt 0 ]; then IOC_CLASS_IAC="warning"; IOC_IAC_DISP="$IOC_IAC";
+else IOC_CLASS_IAC="clean"; IOC_IAC_DISP="0"; fi
+if [ "${SCAN_MODE:-full}" = "quick" ]; then IOC_CLASS_CODE="skipped"; IOC_CODE_DISP="&#x23ED;";
+elif [ "$IOC_CODE" -gt 0 ]; then IOC_CLASS_CODE="warning"; IOC_CODE_DISP="$IOC_CODE";
+else IOC_CLASS_CODE="clean"; IOC_CODE_DISP="0"; fi
+if [ "$IOC_EOL" -gt 0 ]; then IOC_CLASS_EOL="warning"; else IOC_CLASS_EOL="clean"; fi
+if [ "${SCAN_MODE:-full}" = "quick" ]; then IOC_CLASS_SUPPLY="skipped"; IOC_SUPPLY_DISP="&#x23ED;";
+elif [ "${ANCHORE_CRITICAL:-0}" -gt 0 ]; then IOC_CLASS_SUPPLY="alert"; IOC_SUPPLY_DISP="$IOC_SUPPLY";
+elif [ "$IOC_SUPPLY" -gt 0 ]; then IOC_CLASS_SUPPLY="warning"; IOC_SUPPLY_DISP="$IOC_SUPPLY";
+else IOC_CLASS_SUPPLY="clean"; IOC_SUPPLY_DISP="0"; fi
+
+if [ "$GARAK_STATUS" = "not_run" ] || [ "$GARAK_STATUS" = "skipped" ] || [ "$GARAK_STATUS" = "unknown" ]; then
+    IOC_CLASS_LLM="skipped"; IOC_LLM_DISP="&#x23ED;"; IOC_SKIP_LLM="true"
+elif [ "$GARAK_STATUS" = "failed" ]; then
+    IOC_CLASS_LLM="warning"; IOC_LLM_DISP="!"; IOC_SKIP_LLM="false"
+elif [ "$IOC_LLM" -gt 0 ]; then
+    IOC_CLASS_LLM="warning"; IOC_LLM_DISP="$IOC_LLM"; IOC_SKIP_LLM="false"
+else
+    IOC_CLASS_LLM="clean"; IOC_LLM_DISP="0"; IOC_SKIP_LLM="false"
+fi
+# Donut legend percentages (integer math)
+if [ "${TOTAL_FINDINGS:-0}" -gt 0 ]; then
+    PCT_C=$(( TOTAL_CRITICAL * 100 / TOTAL_FINDINGS ))
+    PCT_H=$(( TOTAL_HIGH    * 100 / TOTAL_FINDINGS ))
+    PCT_M=$(( TOTAL_MEDIUM  * 100 / TOTAL_FINDINGS ))
+    PCT_L=$(( TOTAL_LOW     * 100 / TOTAL_FINDINGS ))
+else PCT_C=0; PCT_H=0; PCT_M=0; PCT_L=0; fi
+
+# Add header, IOC summary, donut, and stats
+cat >> "$OUTPUT_HTML" << EOF
+        <div class="header">
+            <h1>BARBATOS</h1>
+            <p class="subtitle" style="color: #9ca3af; font-size: 1.3em; font-weight: 600; margin-top: 5px;">Absolute Security Control</p>
+            <p class="subtitle" style="margin-top: 20px;"><strong>Scan:</strong> $SCAN_NAME</p>
+            <p class="subtitle"><strong>Generated:</strong> $(date '+%B %d, %Y at %I:%M %p')</p>
+        </div>
+
+        <!-- IOC Summary Panel -->
+        <div class="ioc-summary">
+            <h3>🎯 Indicators of Compromise</h3>
+            <div class="ioc-body">
+                <div class="donut-panel">
+                    <div class="donut-canvas-wrap">
+                        <canvas id="severity-donut" width="286" height="286"
+                            data-critical="${TOTAL_CRITICAL}"
+                            data-high="${TOTAL_HIGH}"
+                            data-medium="${TOTAL_MEDIUM}"
+                            data-low="${TOTAL_LOW}"></canvas>
+                        <div class="donut-center">
+                            <div class="donut-center-count">${TOTAL_FINDINGS}</div>
+                            <div class="donut-center-sub">Total</div>
+                        </div>
+                    </div>
+                    <div class="donut-legend">
+                        <div class="donut-legend-item">
+                            <span class="donut-legend-dot" style="background:#C41E3A"></span>
+                            <span class="donut-legend-text">Critical</span>
+                            <span class="donut-legend-count">${TOTAL_CRITICAL}</span>
+                            <span class="donut-legend-pct">${PCT_C}%</span>
+                        </div>
+                        <div class="donut-legend-item">
+                            <span class="donut-legend-dot" style="background:#FF1493"></span>
+                            <span class="donut-legend-text">High</span>
+                            <span class="donut-legend-count">${TOTAL_HIGH}</span>
+                            <span class="donut-legend-pct">${PCT_H}%</span>
+                        </div>
+                        <div class="donut-legend-item">
+                            <span class="donut-legend-dot" style="background:#f97316"></span>
+                            <span class="donut-legend-text">Medium</span>
+                            <span class="donut-legend-count">${TOTAL_MEDIUM}</span>
+                            <span class="donut-legend-pct">${PCT_M}%</span>
+                        </div>
+                        <div class="donut-legend-item">
+                            <span class="donut-legend-dot" style="background:#4ade80"></span>
+                            <span class="donut-legend-text">Low</span>
+                            <span class="donut-legend-count">${TOTAL_LOW}</span>
+                            <span class="donut-legend-pct">${PCT_L}%</span>
+                        </div>
+                        <div class="donut-legend-item" style="background:rgba(251,191,36,.08);border-left:3px solid #fbbf24;">
+                            <span class="donut-legend-dot" style="background:#fbbf24"></span>
+                            <span class="donut-legend-text" style="color:#fbbf24;">Suppressed</span>
+                            <span class="donut-legend-count" style="color:#fbbf24;">${SUPPRESSED_COUNT}</span>
+                            <span class="donut-legend-pct">acknowledged</span>
+                        </div>
+                    </div>
+                    <p style="font-size:0.68em;color:#6b7280;margin-top:10px;">Hover slices for details</p>
+                </div>
+                <div class="ioc-grid">
+                <div class="ioc-card ${IOC_CLASS_SECRETS}">
+                    <div class="ioc-icon">🔑</div>
+                    <div class="donut-canvas-wrap" style="margin:4px 0">
+                        <canvas class="ioc-mini-donut" id="ioc-donut-secrets" width="100" height="100"
+                            data-critical="${TH_CRITICAL}" data-high="0" data-medium="${TH_MEDIUM}" data-low="0"
+                            data-skipped="false" data-source="TruffleHog"></canvas>
+                        <div class="donut-center">
+                            <div class="ioc-mini-total">${IOC_SECRETS}</div>
+                            <div class="ioc-mini-sub">secrets</div>
+                        </div>
+                    </div>
+                    <div class="ioc-label">Exposed Secrets</div>
+                    <div class="ioc-source">TruffleHog</div>
+                </div>
+                <div class="ioc-card ${IOC_CLASS_MALWARE}">
+                    <div class="ioc-icon">🦠</div>
+                    <div class="donut-canvas-wrap" style="margin:4px 0">
+                        <canvas class="ioc-mini-donut" id="ioc-donut-malware" width="100" height="100"
+                            data-critical="${CLAMAV_INFECTED}" data-high="0" data-medium="0" data-low="0"
+                            data-skipped="${IOC_SKIP_MALWARE}" data-source="ClamAV"></canvas>
+                        <div class="donut-center">
+                            <div class="ioc-mini-total">${IOC_MALWARE_DISP}</div>
+                            <div class="ioc-mini-sub">infected</div>
+                        </div>
+                    </div>
+                    <div class="ioc-label">Malware</div>
+                    <div class="ioc-source">ClamAV</div>
+                </div>
+                <div class="ioc-card ${IOC_CLASS_CVES}">
+                    <div class="ioc-icon">📦</div>
+                    <div class="donut-canvas-wrap" style="margin:4px 0">
+                        <canvas class="ioc-mini-donut" id="ioc-donut-cves" width="100" height="100"
+                            data-critical="${IOC_CVE_CRITICAL}" data-high="${IOC_CVE_HIGH}" data-medium="${IOC_CVE_MEDIUM}" data-low="${IOC_CVE_LOW}"
+                            data-skipped="false" data-source="Grype + Trivy"></canvas>
+                        <div class="donut-center">
+                            <div class="ioc-mini-total">${IOC_CVE_TOTAL}</div>
+                            <div class="ioc-mini-sub">CVEs</div>
+                        </div>
+                    </div>
+                    <div class="ioc-label">Dependency CVEs</div>
+                    <div class="ioc-source">Grype + Trivy</div>
+                </div>
+                <div class="ioc-card ${IOC_CLASS_IAC}">
+                    <div class="ioc-icon">⚙️</div>
+                    <div class="donut-canvas-wrap" style="margin:4px 0">
+                        <canvas class="ioc-mini-donut" id="ioc-donut-iac" width="100" height="100"
+                            data-critical="0" data-high="${CHECKOV_FAILED}" data-medium="0" data-low="0"
+                            data-skipped="${IOC_SKIP_IAC}" data-source="Checkov"></canvas>
+                        <div class="donut-center">
+                            <div class="ioc-mini-total">${IOC_IAC_DISP}</div>
+                            <div class="ioc-mini-sub">failures</div>
+                        </div>
+                    </div>
+                    <div class="ioc-label">IaC Issues</div>
+                    <div class="ioc-source">Checkov</div>
+                </div>
+                <div class="ioc-card ${IOC_CLASS_CODE}">
+                    <div class="ioc-icon">💻</div>
+                    <div class="donut-canvas-wrap" style="margin:4px 0">
+                        <canvas class="ioc-mini-donut" id="ioc-donut-code" width="100" height="100"
+                            data-critical="${SONAR_CRITICAL}" data-high="${SONAR_HIGH}" data-medium="${SONAR_SECURITY_HOTSPOTS}" data-low="${SONAR_CODE_SMELLS}"
+                            data-skipped="${IOC_SKIP_CODE}" data-source="SonarQube"></canvas>
+                        <div class="donut-center">
+                            <div class="ioc-mini-total">${IOC_CODE_DISP}</div>
+                            <div class="ioc-mini-sub">issues</div>
+                        </div>
+                    </div>
+                    <div class="ioc-label">Code Bugs/Vulns</div>
+                    <div class="ioc-source">SonarQube</div>
+                </div>
+                <div class="ioc-card ${IOC_CLASS_EOL}">
+                    <div class="ioc-icon">⚰️</div>
+                    <div class="donut-canvas-wrap" style="margin:4px 0">
+                        <canvas class="ioc-mini-donut" id="ioc-donut-eol" width="100" height="100"
+                            data-critical="${XEOL_CRITICAL}" data-high="${XEOL_HIGH}" data-medium="${XEOL_MEDIUM}" data-low="${XEOL_LOW}"
+                            data-skipped="false" data-source="Xeol"></canvas>
+                        <div class="donut-center">
+                            <div class="ioc-mini-total">${IOC_EOL}</div>
+                            <div class="ioc-mini-sub">EOL</div>
+                        </div>
+                    </div>
+                    <div class="ioc-label">EOL Components</div>
+                    <div class="ioc-source">Xeol</div>
+                </div>
+                <div class="ioc-card ${IOC_CLASS_SUPPLY}">
+                    <div class="ioc-icon">⚓</div>
+                    <div class="donut-canvas-wrap" style="margin:4px 0">
+                        <canvas class="ioc-mini-donut" id="ioc-donut-supply" width="100" height="100"
+                            data-critical="${ANCHORE_CRITICAL}" data-high="${ANCHORE_HIGH}" data-medium="${ANCHORE_MEDIUM}" data-low="${ANCHORE_LOW}"
+                            data-skipped="${IOC_SKIP_SUPPLY}" data-source="Anchore"></canvas>
+                        <div class="donut-center">
+                            <div class="ioc-mini-total">${IOC_SUPPLY_DISP}</div>
+                            <div class="ioc-mini-sub">vulns</div>
+                        </div>
+                    </div>
+                    <div class="ioc-label">Supply Chain</div>
+                    <div class="ioc-source">Anchore</div>
+                </div>
+                <div class="ioc-card ${IOC_CLASS_LLM}">
+                    <div class="ioc-icon">🤖</div>
+                    <div class="donut-canvas-wrap" style="margin:4px 0">
+                        <canvas class="ioc-mini-donut" id="ioc-donut-llm" width="100" height="100"
+                            data-critical="0" data-high="${GARAK_HITS}" data-medium="0" data-low="0"
+                            data-skipped="${IOC_SKIP_LLM}" data-source="Garak"></canvas>
+                        <div class="donut-center">
+                            <div class="ioc-mini-total">${IOC_LLM_DISP}</div>
+                            <div class="ioc-mini-sub">hits</div>
+                        </div>
+                    </div>
+                    <div class="ioc-label">LLM Probe Hits</div>
+                    <div class="ioc-source">Garak</div>
+                </div>
+                </div>
+            </div>
+        </div>
+        <div id="donut-tooltip"></div>
+
+        <!-- Show suppressed findings info if any -->
+        ${SUPPRESSED_HTML}
+
+        <div class="filter-bar">
+            <span class="filter-label">🔍 Filter by Severity:</span>
+            <div class="filter-chips">
+                <button class="filter-chip filter-chip-all active" onclick="filterBySeverity('all')">
+                    All <span class="chip-count">${TOTAL_FINDINGS}</span>
+                </button>
+                <button class="filter-chip filter-chip-critical" onclick="filterBySeverity('critical')">
+                    ❗ Critical <span class="chip-count">${TOTAL_CRITICAL}</span>
+                </button>
+                <button class="filter-chip filter-chip-high" onclick="filterBySeverity('high')">
+                    ⚠️ High <span class="chip-count">${TOTAL_HIGH}</span>
+                </button>
+                <button class="filter-chip filter-chip-medium" onclick="filterBySeverity('medium')">
+                    ⚡ Medium <span class="chip-count">${TOTAL_MEDIUM}</span>
+                </button>
+                <button class="filter-chip filter-chip-low" onclick="filterBySeverity('low')">
+                    📌 Low <span class="chip-count">${TOTAL_LOW}</span>
+                </button>
+            </div>
+        </div>
+        
+        <div class="filter-bar" style="margin-top: 10px;">
+            <span class="filter-label">📦 Filter by Source:</span>
+            <div class="filter-chips">
+                <button class="filter-chip source-chip source-chip-all active" onclick="filterBySource('all')" id="source-all">
+                    All Sources <span class="chip-count" id="source-count-all">${TOTAL_FINDINGS}</span>
+                </button>
+                <button class="filter-chip source-chip source-chip-image" onclick="filterBySource('image')" id="source-image" style="background: #1a2a3a; border-color: #3b82f6; color: #60a5fa;">
+                    🐳 Container Image <span class="chip-count" id="source-count-image">0</span>
+                </button>
+                <button class="filter-chip source-chip source-chip-app" onclick="filterBySource('app')" id="source-app" style="background: #2a1f15; border-color: #f97316; color: #fb923c;">
+                    📁 Application/Config <span class="chip-count" id="source-count-app">0</span>
+                </button>
+            </div>
+            <div class="sort-controls">
+                <span class="filter-label">Sort:</span>
+                <button class="sort-btn active" onclick="sortFindings('severity')" id="sort-severity">
+                    ↕️ Severity
+                </button>
+                <button class="sort-btn" onclick="sortFindings('tool')" id="sort-tool">
+                    🔧 Tool
+                </button>
+            </div>
+        </div>
+        
+        <!-- Source Legend -->
+        <div style="background: #1a1d23; border-radius: 8px; padding: 12px 16px; margin-top: 15px; margin-bottom: 15px; font-size: 0.85em; border-left: 4px solid #C41E3A; border: 1px solid #4a5568;">
+            <strong style="color: #e8eaed;">📋 Understanding Vulnerability Sources:</strong>
+            <div style="display: flex; flex-wrap: wrap; gap: 20px; margin-top: 8px;">
+                <div style="display: flex; align-items: center; gap: 6px;">
+                    <span style="background: #2C3539; padding: 2px 8px; border-radius: 4px; color: #60a5fa; border: 1px solid #3b82f6;">🐳 Container Image</span>
+                    <span style="color: #9ca3af;">= Bundled in base image (npm, pip, OS packages)</span>
+                </div>
+                <div style="display: flex; align-items: center; gap: 6px;">
+                    <span style="background: #2C3539; padding: 2px 8px; border-radius: 4px; color: #fb923c; border: 1px solid #f97316;">📁 Application/Config</span>
+                    <span style="color: #9ca3af;">= Your code, secrets, IaC misconfigurations</span>
+                </div>
+            </div>
+        </div>
+        
+        <div class="filter-results" id="filter-results" style="display: none;">
+            <span class="filter-results-count" id="filter-count">Showing 0 findings</span>
+            <a class="clear-filter" onclick="filterBySeverity('all'); filterBySource('all');">Clear Filters ✕</a>
+        </div>
+
+        <div class="tools-section">
+            <!-- TruffleHog -->
+            <div class="tool-card">
+                <div class="tool-header" onclick="toggleTool('trufflehog')">
+                    <div class="tool-title">
+                        <span class="tool-icon">🔍</span>
+                        <div>
+                            <div>TruffleHog</div>
+                            <div style="font-size: 0.6em; font-weight: 400; color: #718096;">Secret Detection</div>
+                        </div>
+                    </div>
+                    <div class="tool-stats">
+EOF
+
+# Add TruffleHog stats
+if [ "$TH_CRITICAL" -gt 0 ]; then
+    echo "                        <span class=\"tool-stat-badge badge-critical\">❗ ${TH_CRITICAL}</span>" >> "$OUTPUT_HTML"
+fi
+if [ "$TH_MEDIUM" -gt 0 ]; then
+    echo "                        <span class=\"tool-stat-badge badge-medium\">⚡ ${TH_MEDIUM}</span>" >> "$OUTPUT_HTML"
+fi
+if [ "$TH_CRITICAL" -eq 0 ] && [ "$TH_MEDIUM" -eq 0 ]; then
+    echo "                        <span class=\"tool-stat-badge badge-clean\">✅ Clean</span>" >> "$OUTPUT_HTML"
+fi
+
+cat >> "$OUTPUT_HTML" << EOF
+                        <span class="expand-icon">▼</span>
+                    </div>
+                </div>
+                <div class="tool-content" id="trufflehog-content">
+                    <div class="tool-findings">
+EOF
+
+# Show status banner if failed or skipped
+if [ "$TH_STATUS" = "failed" ] || [ "$TH_STATUS" = "skipped" ]; then
+    generate_status_banner "$TH_STATUS" "$TH_STATUS_REASON" "TruffleHog" >> "$OUTPUT_HTML"
+fi
+
+cat >> "$OUTPUT_HTML" << EOF
+                        <div class="stats-detail-box">
+                            <h4>📊 Scan Statistics</h4>
+                            <div class="stats-grid-small">
+                                <div class="stat-item"><strong>Total Findings:</strong> ${TH_TOTAL_FINDINGS}</div>
+                                <div class="stat-item"><strong>Verified Secrets:</strong> ${TH_VERIFIED}</div>
+                                <div class="stat-item"><strong>Unverified:</strong> ${TH_UNVERIFIED}</div>
+                                <div class="stat-item"><strong>Detector Types Used:</strong> ${TH_DETECTORS_USED}</div>
+                                <div class="stat-item"><strong>Files with Findings:</strong> ${TH_FILES_WITH_FINDINGS:-0}</div>
+                            </div>
+                        </div>
+                        ${TH_FINDINGS}
+                    </div>
+                </div>
+            </div>
+
+            <!-- ClamAV -->
+            <div class="tool-card">
+                <div class="tool-header" onclick="toggleTool('clamav')">
+                    <div class="tool-title">
+                        <span class="tool-icon">🦠</span>
+                        <div>
+                            <div>ClamAV</div>
+                            <div style="font-size: 0.6em; font-weight: 400; color: #718096;">Malware Scanner</div>
+                        </div>
+                    </div>
+                    <div class="tool-stats">
+EOF
+
+# Add ClamAV stats
+if [ "${SCAN_MODE:-full}" = "quick" ]; then
+    echo "                        <span class=\"tool-stat-badge badge-skipped\">⏭️ Not run in quick mode</span>" >> "$OUTPUT_HTML"
+elif [ "$CLAMAV_CRITICAL" -gt 0 ]; then
+    echo "                        <span class=\"tool-stat-badge badge-critical\">❗ ${CLAMAV_CRITICAL}</span>" >> "$OUTPUT_HTML"
+else
+    echo "                        <span class=\"tool-stat-badge badge-clean\">✅ Clean</span>" >> "$OUTPUT_HTML"
+fi
+
+cat >> "$OUTPUT_HTML" << EOF
+                        <span class="expand-icon">▼</span>
+                    </div>
+                </div>
+                <div class="tool-content" id="clamav-content">
+                    <div class="tool-findings">
+                        <div class="stats-detail-box">
+                            <h4>📊 Scan Statistics</h4>
+                            <div class="stats-grid-small">
+                                <div class="stat-item"><strong>Files Scanned:</strong> ${CLAMAV_FILES_SCANNED}</div>
+                                <div class="stat-item"><strong>Directories Scanned:</strong> ${CLAMAV_DIRECTORIES}</div>
+                                <div class="stat-item"><strong>Data Scanned:</strong> ${CLAMAV_DATA_SCANNED}</div>
+                                <div class="stat-item"><strong>Scan Duration:</strong> ${CLAMAV_SCAN_TIME}</div>
+                                <div class="stat-item"><strong>Engine Version:</strong> ${CLAMAV_ENGINE_VERSION}</div>
+                                <div class="stat-item"><strong>Virus Database:</strong> ${CLAMAV_VIRUS_DB_COUNT} signatures</div>
+                                <div class="stat-item"><strong>Infected Files:</strong> ${CLAMAV_INFECTED}</div>
+                            </div>
+                        </div>
+                        ${CLAMAV_FINDINGS}
+                    </div>
+                </div>
+            </div>
+
+            <!-- SonarQube -->
+            <div class="tool-card">
+                <div class="tool-header" onclick="toggleTool('sonar')">
+                    <div class="tool-title">
+                        <span class="tool-icon">📊</span>
+                        <div>
+                            <div>SonarQube</div>
+                            <div style="font-size: 0.6em; font-weight: 400; color: #718096;">Code Quality</div>
+                        </div>
+                    </div>
+                    <div class="tool-stats">
+EOF
+
+# Determine SonarQube status badge based on SONAR_STATUS
+if [ "$SONAR_STATUS" = "SKIPPED" ]; then
+    echo "                        <span class=\"tool-stat-badge\" style=\"background: #2a1c00; color: #fbbf24;\">⚠️ Skipped</span>" >> "$OUTPUT_HTML"
+elif [ "$SONAR_STATUS" = "NO_PROJECT_DETECTED" ] || [ "$SONAR_STATUS" = "N/A" ]; then
+    echo "                        <span class=\"tool-stat-badge\" style=\"background: #e5e7eb; color: #6b7280;\">➖ Not Configured</span>" >> "$OUTPUT_HTML"
+elif [ "$SONAR_CRITICAL" -gt 0 ] || [ "$SONAR_HIGH" -gt 0 ]; then
+    echo "                        <span class=\"tool-stat-badge badge-high\">⚠️ ${SONAR_CRITICAL} Critical, ${SONAR_HIGH} High</span>" >> "$OUTPUT_HTML"
+else
+    echo "                        <span class=\"tool-stat-badge badge-clean\">✅ Clean</span>" >> "$OUTPUT_HTML"
+fi
+
+cat >> "$OUTPUT_HTML" << EOF
+                        <span class="expand-icon">▼</span>
+                    </div>
+                </div>
+                <div class="tool-content" id="sonar-content">
+                    <div class="tool-findings">
+                        ${SONAR_FINDINGS}
+                    </div>
+                </div>
+            </div>
+
+            <!-- Checkov -->
+            <div class="tool-card">
+                <div class="tool-header" onclick="toggleTool('checkov')">
+                    <div class="tool-title">
+                        <span class="tool-icon">🔐</span>
+                        <div>
+                            <div>Checkov</div>
+                            <div style="font-size: 0.6em; font-weight: 400; color: #718096;">IaC Security</div>
+                        </div>
+                    </div>
+                    <div class="tool-stats">
+EOF
+
+# Add Checkov stats dynamically
+if [ "$CHECKOV_TOTAL" -eq 0 ] && [ ! -d "$CHECKOV_DIR" ] || [ -z "$(find "$CHECKOV_DIR" -name '*.json' -type f ! -name '*summary*' 2>/dev/null)" ]; then
+    echo "                        <span class=\"tool-stat-badge badge-skipped\">⏭️ Skipped</span>" >> "$OUTPUT_HTML"
+elif [ "$CHECKOV_FAILED" -gt 0 ]; then
+    echo "                        <span class=\"tool-stat-badge badge-high\">⚠️ ${CHECKOV_FAILED} Failed</span>" >> "$OUTPUT_HTML"
+else
+    echo "                        <span class=\"tool-stat-badge badge-clean\">✅ Clean</span>" >> "$OUTPUT_HTML"
+fi
+
+cat >> "$OUTPUT_HTML" << EOF
+                        <span class="expand-icon">▼</span>
+                    </div>
+                </div>
+                <div class="tool-content" id="checkov-content">
+                    <div class="tool-findings">
+                        ${CHECKOV_FINDINGS}
+                    </div>
+                </div>
+            </div>
+
+            <!-- Helm -->
+            <div class="tool-card">
+                <div class="tool-header" onclick="toggleTool('helm')">
+                    <div class="tool-title">
+                        <span class="tool-icon">⚓</span>
+                        <div>
+                            <div>Helm</div>
+                            <div style="font-size: 0.6em; font-weight: 400; color: #718096;">Chart Validation</div>
+                        </div>
+                    </div>
+                    <div class="tool-stats">
+                        <span class="tool-stat-badge badge-clean">✅ Clean</span>
+                        <span class="expand-icon">▼</span>
+                    </div>
+                </div>
+                <div class="tool-content" id="helm-content">
+                    <div class="tool-findings">
+                        ${HELM_FINDINGS}
+                    </div>
+                </div>
+            </div>
+
+            <!-- Trivy -->
+            <div class="tool-card">
+                <div class="tool-header" onclick="toggleTool('trivy')">
+                    <div class="tool-title">
+                        <span class="tool-icon">🐳</span>
+                        <div>
+                            <div>Trivy</div>
+                            <div style="font-size: 0.6em; font-weight: 400; color: #718096;">Container Vulnerability Scanner</div>
+                        </div>
+                    </div>
+                    <div class="tool-stats">
+EOF
+
+# Add Trivy stats
+if [ "$TRIVY_CRITICAL" -gt 0 ]; then
+    echo "                        <span class=\"tool-stat-badge badge-critical\">❗ ${TRIVY_CRITICAL}</span>" >> "$OUTPUT_HTML"
+fi
+if [ "$TRIVY_HIGH" -gt 0 ]; then
+    echo "                        <span class=\"tool-stat-badge badge-high\">⚠️ ${TRIVY_HIGH}</span>" >> "$OUTPUT_HTML"
+fi
+if [ "$TRIVY_MEDIUM" -gt 0 ]; then
+    echo "                        <span class=\"tool-stat-badge badge-medium\">🔶 ${TRIVY_MEDIUM}</span>" >> "$OUTPUT_HTML"
+fi
+if [ "$TRIVY_LOW" -gt 0 ]; then
+    echo "                        <span class=\"tool-stat-badge badge-low\">🔵 ${TRIVY_LOW}</span>" >> "$OUTPUT_HTML"
+fi
+if [ "$TRIVY_TOTAL_VULNS" -eq 0 ]; then
+    echo "                        <span class=\"tool-stat-badge badge-clean\">✅ Clean</span>" >> "$OUTPUT_HTML"
+fi
+
+cat >> "$OUTPUT_HTML" << EOF
+                        <span class="expand-icon">▼</span>
+                    </div>
+                </div>
+                <div class="tool-content" id="trivy-content">
+                    <div class="tool-findings">
+                        <div class="stats-detail-box">
+                            <h4>📊 Scan Statistics</h4>
+                            <div class="stats-grid-small">
+                                <div class="stat-item"><strong>Images Scanned:</strong> ${TRIVY_IMAGES_SCANNED}</div>
+                                <div class="stat-item"><strong>Total Vulnerabilities:</strong> ${TRIVY_TOTAL_VULNS}</div>
+                                <div class="stat-item"><strong>Critical:</strong> ${TRIVY_CRITICAL}</div>
+                                <div class="stat-item"><strong>High:</strong> ${TRIVY_HIGH}</div>
+                                <div class="stat-item"><strong>Medium:</strong> ${TRIVY_MEDIUM}</div>
+                                <div class="stat-item"><strong>Low:</strong> ${TRIVY_LOW}</div>
+                            </div>
+                        </div>
+                        ${TRIVY_FINDINGS}
+                    </div>
+                </div>
+            </div>
+
+            <!-- Grype -->
+            <div class="tool-card">
+                <div class="tool-header" onclick="toggleTool('grype')">
+                    <div class="tool-title">
+                        <span class="tool-icon">🦑</span>
+                        <div>
+                            <div>Grype</div>
+                            <div style="font-size: 0.6em; font-weight: 400; color: #718096;">Vulnerability Detector</div>
+                        </div>
+                    </div>
+                    <div class="tool-stats">
+EOF
+
+# Add Grype stats
+if [ "$GRYPE_CRITICAL" -gt 0 ]; then
+    echo "                        <span class=\"tool-stat-badge badge-critical\">❗ ${GRYPE_CRITICAL}</span>" >> "$OUTPUT_HTML"
+fi
+if [ "$GRYPE_HIGH" -gt 0 ]; then
+    echo "                        <span class=\"tool-stat-badge badge-high\">⚠️ ${GRYPE_HIGH}</span>" >> "$OUTPUT_HTML"
+fi
+if [ "$GRYPE_MEDIUM" -gt 0 ]; then
+    echo "                        <span class=\"tool-stat-badge badge-medium\">🔶 ${GRYPE_MEDIUM}</span>" >> "$OUTPUT_HTML"
+fi
+if [ "$GRYPE_LOW" -gt 0 ]; then
+    echo "                        <span class=\"tool-stat-badge badge-low\">🔵 ${GRYPE_LOW}</span>" >> "$OUTPUT_HTML"
+fi
+if [ "$GRYPE_TOTAL_VULNS" -eq 0 ]; then
+    echo "                        <span class=\"tool-stat-badge badge-clean\">✅ Clean</span>" >> "$OUTPUT_HTML"
+fi
+
+cat >> "$OUTPUT_HTML" << EOF
+                        <span class="expand-icon">▼</span>
+                    </div>
+                </div>
+                <div class="tool-content" id="grype-content">
+                    <div class="tool-findings">
+                        <div class="stats-detail-box">
+                            <h4>📊 Scan Statistics</h4>
+                            <div class="stats-grid-small">
+                                <div class="stat-item"><strong>Targets Scanned:</strong> ${GRYPE_TARGETS_SCANNED}</div>
+                                <div class="stat-item"><strong>Total Vulnerabilities:</strong> ${GRYPE_TOTAL_VULNS}</div>
+                                <div class="stat-item"><strong>Critical:</strong> ${GRYPE_CRITICAL}</div>
+                                <div class="stat-item"><strong>High:</strong> ${GRYPE_HIGH}</div>
+                                <div class="stat-item"><strong>Medium:</strong> ${GRYPE_MEDIUM}</div>
+                                <div class="stat-item"><strong>Low:</strong> ${GRYPE_LOW}</div>
+                            </div>
+                        </div>
+                        ${GRYPE_FINDINGS}
+                    </div>
+                </div>
+            </div>
+
+            <!-- SBOM -->
+            <div class="tool-card">
+                <div class="tool-header" onclick="toggleTool('sbom')">
+                    <div class="tool-title">
+                        <span class="tool-icon">📦</span>
+                        <div>
+                            <div>SBOM</div>
+                            <div style="font-size: 0.6em; font-weight: 400; color: #718096;">Software Bill of Materials</div>
+                        </div>
+                    </div>
+                    <div class="tool-stats">
+                        <span class="tool-stat-badge" style="background: #e0f2fe; color: #0369a1;">📊 ${SBOM_PACKAGES} packages</span>
+                        <span class="expand-icon">▼</span>
+                    </div>
+                </div>
+                <div class="tool-content" id="sbom-content">
+                    <div class="tool-findings">
+                        <div class="stats-detail-box">
+                            <h4>📊 SBOM Statistics</h4>
+                            <div class="stats-grid-small">
+                                <div class="stat-item"><strong>Total Packages:</strong> ${SBOM_PACKAGES}</div>
+                                <div class="stat-item"><strong>Licenses Clean:</strong> ${LICENSE_CLEAN_COUNT} allowed, ${LICENSE_DENIED_COUNT} denied, ${LICENSE_UNKNOWN_COUNT} unknown</div>
+                                <div class="stat-item"><strong>Dependency Relationships:</strong> ${LINEAGE_TOP_COUNT}</div>
+                                <div class="stat-item"><strong>Hash Verified (PyPI):</strong> ${HASH_VERIFIED} ok, ${HASH_TAMPERED} mismatches</div>
+                                <div class="stat-item"><strong>VEX Suppressions:</strong> ${VEX_SUPPRESSED} applied</div>
+                            </div>
+                        </div>
+                        
+                        ${SBOM_FINDINGS}
+                    </div>
+                </div>
+            </div>
+EOF
+
+# ---- Xeol (EOL Detection) Section ----
+cat >> "$OUTPUT_HTML" << EOF
+            <!-- Xeol (EOL Detection) -->
+            <div class="tool-card">
+                <div class="tool-header" onclick="toggleTool('xeol')">
+                    <div class="tool-title">
+                        <span class="tool-icon"></span>
+                        <div>
+                            <div>Xeol</div>
+                            <div style="font-size: 0.6em; font-weight: 400; color: #718096;">End-of-Life Detection</div>
+                        </div>
+                    </div>
+                    <div class="tool-stats">
+EOF
+
+# Add Xeol stats
+if [ "$XEOL_HIGH" -gt 0 ]; then
+    echo "                        <span class=\"tool-stat-badge badge-high\">⚠️ ${XEOL_HIGH} EOL</span>" >> "$OUTPUT_HTML"
+else
+    echo "                        <span class=\"tool-stat-badge badge-clean\">✅ Clean</span>" >> "$OUTPUT_HTML"
+fi
+
+cat >> "$OUTPUT_HTML" << EOF
+                        <span class="expand-icon">▼</span>
+                    </div>
+                </div>
+                <div class="tool-content" id="xeol-content">
+                    <div class="tool-findings">
+                        <div class="stats-detail-box">
+                            <h4>📊 EOL Detection Statistics</h4>
+                            <div class="stats-grid-small">
+                                <div class="stat-item"><strong>🐳 Base Images Scanned:</strong> ${XEOL_IMAGES_SCANNED}</div>
+                                <div class="stat-item"><strong>📁 Filesystem Paths:</strong> ${XEOL_FILESYSTEM_PATHS}</div>
+                                <div class="stat-item"><strong>⚰️ EOL Components:</strong> ${XEOL_TOTAL_EOL}</div>
+                                <div class="stat-item"><strong>🗄️ Database Version:</strong> ${XEOL_DB_VERSION}</div>
+                                <div class="stat-item"><strong>⏱️ Scan Duration:</strong> ${XEOL_SCAN_DURATION}s</div>
+                                <div class="stat-item"><strong>📊 Data Source:</strong> endoflife.date</div>
+                            </div>
+                        </div>
+                        ${XEOL_FINDINGS}
+                    </div>
+                </div>
+            </div>
+
+            <!-- Anchore -->
+            <div class="tool-card">
+                <div class="tool-header" onclick="toggleTool('anchore')">
+                    <div class="tool-title">
+                        <span class="tool-icon">⚓</span>
+                        <div>
+                            <div>Anchore</div>
+                            <div style="font-size: 0.6em; font-weight: 400; color: #718096;">Enterprise Security Scanner</div>
+                        </div>
+                    </div>
+                    <div class="tool-stats">
+EOF
+
+# Add Anchore stats
+if [ "${SCAN_MODE:-full}" = "quick" ]; then
+    echo "                        <span class=\"tool-stat-badge badge-skipped\">⏭️ Not run in quick mode</span>" >> "$OUTPUT_HTML"
+elif [ "$ANCHORE_CRITICAL" -gt 0 ]; then
+    echo "                        <span class=\"tool-stat-badge badge-critical\">❗ ${ANCHORE_CRITICAL}</span>" >> "$OUTPUT_HTML"
+elif [ "$ANCHORE_HIGH" -gt 0 ]; then
+    echo "                        <span class=\"tool-stat-badge badge-high\">⚠️ ${ANCHORE_HIGH}</span>" >> "$OUTPUT_HTML"
+elif [ "$ANCHORE_STATUS" = "placeholder" ]; then
+    echo "                        <span class=\"tool-stat-badge\" style=\"background: #e0f2fe; color: #0369a1;\">ℹ️ Planned</span>" >> "$OUTPUT_HTML"
+else
+    echo "                        <span class=\"tool-stat-badge badge-clean\">✅ Clean</span>" >> "$OUTPUT_HTML"
+fi
+
+cat >> "$OUTPUT_HTML" << EOF
+                        <span class="expand-icon">▼</span>
+                    </div>
+                </div>
+                <div class="tool-content" id="anchore-content">
+                    <div class="tool-findings">
+                        <div class="stats-detail-box">
+                            <h4>📊 Anchore Statistics</h4>
+                            <div class="stats-grid-small">
+                                <div class="stat-item"><strong>Status:</strong> ${ANCHORE_STATUS}</div>
+                                <div class="stat-item"><strong>Total Vulnerabilities:</strong> ${ANCHORE_TOTAL_VULNS}</div>
+                                <div class="stat-item"><strong>Critical:</strong> ${ANCHORE_CRITICAL}</div>
+                                <div class="stat-item"><strong>High:</strong> ${ANCHORE_HIGH}</div>
+                                <div class="stat-item"><strong>Medium:</strong> ${ANCHORE_MEDIUM}</div>
+                                <div class="stat-item"><strong>Low:</strong> ${ANCHORE_LOW}</div>
+                            </div>
+                        </div>
+                        ${ANCHORE_FINDINGS}
+                    </div>
+                </div>
+            </div>
+
+            <!-- Garak -->
+            <div class="tool-card">
+                <div class="tool-header" onclick="toggleTool('garak')">
+                    <div class="tool-title">
+                        <span class="tool-icon">🤖</span>
+                        <div>
+                            <div>Garak</div>
+                            <div style="font-size: 0.6em; font-weight: 400; color: #718096;">LLM Security Probing</div>
+                        </div>
+                    </div>
+                    <div class="tool-stats">
+EOF
+
+# Add Garak status badge
+if [ "$GARAK_STATUS" = "not_run" ] || [ "$GARAK_STATUS" = "unknown" ]; then
+    echo "                        <span class=\"tool-stat-badge badge-skipped\">⏭️ Not run</span>" >> "$OUTPUT_HTML"
+elif [ "$GARAK_STATUS" = "skipped" ]; then
+    echo "                        <span class=\"tool-stat-badge badge-skipped\">⏭️ Skipped</span>" >> "$OUTPUT_HTML"
+elif [ "$GARAK_STATUS" = "failed" ]; then
+    echo "                        <span class=\"tool-stat-badge badge-high\">⚠️ Failed</span>" >> "$OUTPUT_HTML"
+elif [ "$GARAK_HITS" -gt 0 ]; then
+    echo "                        <span class=\"tool-stat-badge badge-high\">⚠️ ${GARAK_HITS} Hits</span>" >> "$OUTPUT_HTML"
+else
+    echo "                        <span class=\"tool-stat-badge badge-clean\">✅ Clean</span>" >> "$OUTPUT_HTML"
+fi
+
+cat >> "$OUTPUT_HTML" << EOF
+                        <span class="expand-icon">▼</span>
+                    </div>
+                </div>
+                <div class="tool-content" id="garak-content">
+                    <div class="tool-findings">
+                        <div class="stats-detail-box">
+                            <h4>📊 Garak LLM Scan Statistics</h4>
+                            <div class="stats-grid-small">
+                                <div class="stat-item"><strong>Status:</strong> ${GARAK_STATUS}</div>
+                                <div class="stat-item"><strong>Target Type:</strong> ${GARAK_TARGET_TYPE}</div>
+                                <div class="stat-item"><strong>Target Name:</strong> ${GARAK_TARGET_NAME}</div>
+                                <div class="stat-item"><strong>Runtime Target:</strong> ${GARAK_RUNTIME_TARGET}</div>
+                                <div class="stat-item"><strong>Runtime Class:</strong> ${GARAK_RUNTIME_CLASSIFICATION}</div>
+                                <div class="stat-item"><strong>Target Origin:</strong> ${GARAK_TARGET_ORIGIN}</div>
+                                <div class="stat-item"><strong>Probes:</strong> ${GARAK_PROBES}</div>
+                                <div class="stat-item"><strong>Hit Count:</strong> ${GARAK_HITS}</div>
+                                <div class="stat-item"><strong>Exit Code:</strong> ${GARAK_EXIT_CODE}</div>
+                            </div>
+                            <div style="margin-top:10px;color:#9ca3af;font-size:0.9em;word-break:break-word;">
+                                <div><strong>Reason:</strong> ${GARAK_REASON:-N/A}</div>
+                                <div><strong>Console Log:</strong> <code>${GARAK_CONSOLE_LOG:-N/A}</code></div>
+                                <div><strong>Run Report:</strong> <code>$(basename "${GARAK_REPORT_JSONL:-}")</code></div>
+                                <div><strong>Hit Log:</strong> <code>$(basename "${GARAK_HIT_LOG:-}")</code></div>
+                            </div>
+                            <div style="margin-top:8px;padding:8px 10px;background:#0f172a;border:1px solid #1f2937;border-radius:6px;color:#cbd5e1;font-size:0.85em;line-height:1.45;">
+                                <div><strong>Runtime Class Legend:</strong></div>
+                                <div><code>api-provider</code>: Hosted API endpoint (OpenAI/Azure/Anthropic)</div>
+                                <div><code>local-runtime</code>: Local model runtime (for example, Ollama)</div>
+                                <div><code>provider-library</code>: Provider SDK or library-backed target</div>
+                                <div><code>test-generator</code>: Garak built-in test target (no external model)</div>
+                                <div><code>custom</code>: Non-standard or unmapped target type</div>
+                            </div>
+                        </div>
+                        ${GARAK_FINDINGS}
+                    </div>
+                </div>
+            </div>
+
+            <!-- API Discovery -->
+            <div class="tool-card">
+                <div class="tool-header" onclick="toggleTool('api-discovery')">
+                    <div class="tool-title">
+                        <span class="tool-icon">🌐</span>
+                        <div>
+                            <div>API Discovery</div>
+                            <div style="font-size: 0.6em; font-weight: 400; color: #718096;">OpenAPI, REST, GraphQL Detection</div>
+                        </div>
+                    </div>
+                    <div class="tool-stats">
+EOF
+
+# Add API Discovery stats
+if [ "$API_TOTAL_DISCOVERED" -gt 0 ]; then
+    echo "                        <span class=\"tool-stat-badge\" style=\"background: #0c1a2e; color: #60a5fa;\">🔍 ${API_TOTAL_DISCOVERED}</span>" >> "$OUTPUT_HTML"
+else
+    if [ "$API_STATUS" = "not_run" ]; then
+        echo "                        <span class=\"tool-stat-badge\" style=\"background: #2a1c00; color: #fbbf24;\">⏭️ Skipped</span>" >> "$OUTPUT_HTML"
+    else
+        echo "                        <span class=\"tool-stat-badge\" style=\"background: #f3f4f6; color: #6b7280;\">0 Found</span>" >> "$OUTPUT_HTML"
+    fi
+fi
+
+cat >> "$OUTPUT_HTML" << EOF
+                        <span class="expand-icon">▼</span>
+                    </div>
+                </div>
+                <div class="tool-content" id="api-discovery-content">
+                    <div class="tool-findings">
+                        <div style="background: linear-gradient(135deg, #1e3a5f 0%, #152a3f 100%); border-radius: 12px; padding: 20px; margin: 20px 0; box-shadow: 0 4px 20px rgba(0,0,0,0.4); border: 1px solid #3b82f6;">
+                            <div style="margin-bottom: 15px;">
+                                <h4 style="margin: 0 0 8px 0; color: white; font-size: 1.1em;">💾 Export API Discovery</h4>
+                                <p style="margin: 0; color: #93c5fd; font-size: 0.9em;">Download API documentation and discovered endpoints</p>
+                            </div>
+                            <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+                                <button onclick="exportAPI('json')" style="background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%); color: white; border: none; padding: 10px 20px; border-radius: 8px; font-weight: 600; cursor: pointer; transition: all 0.2s; box-shadow: 0 2px 8px rgba(59,130,246,0.3);" onmouseover="this.style.transform='translateY(-2px)'; this.style.boxShadow='0 4px 12px rgba(59,130,246,0.4)'" onmouseout="this.style.transform='translateY(0)'; this.style.boxShadow='0 2px 8px rgba(59,130,246,0.3)'">
+                                    <span style="margin-right: 6px;">📄</span> JSON
+                                </button>
+                                <button onclick="exportAPI('openapi')" style="background: linear-gradient(135deg, #10b981 0%, #059669 100%); color: white; border: none; padding: 10px 20px; border-radius: 8px; font-weight: 600; cursor: pointer; transition: all 0.2s; box-shadow: 0 2px 8px rgba(16,185,129,0.3);" onmouseover="this.style.transform='translateY(-2px)'; this.style.boxShadow='0 4px 12px rgba(16,185,129,0.4)'" onmouseout="this.style.transform='translateY(0)'; this.style.boxShadow='0 2px 8px rgba(16,185,129,0.3)'">
+                                    <span style="margin-right: 6px;">📋</span> OpenAPI Specs
+                                </button>
+                                <button onclick="exportAPI('all')" style="background: linear-gradient(135deg, #C41E3A 0%, #8B1328 100%); color: white; border: none; padding: 10px 20px; border-radius: 8px; font-weight: 600; cursor: pointer; transition: all 0.2s; box-shadow: 0 2px 8px rgba(196,30,58,0.3);" onmouseover="this.style.transform='translateY(-2px)'; this.style.boxShadow='0 4px 12px rgba(196,30,58,0.4)'" onmouseout="this.style.transform='translateY(0)'; this.style.boxShadow='0 2px 8px rgba(196,30,58,0.3)'">
+                                    <span style="margin-right: 6px;">💾</span> Export All
+                                </button>
+                            </div>
+                            <div id="api-export-status" style="margin-top: 15px; padding: 12px; border-radius: 6px; display: none;">
+                                <!-- Export status messages will appear here -->
+                            </div>
+                            <div style="margin-top: 12px; padding: 10px; background: rgba(59,130,246,0.15); border-left: 3px solid #3b82f6; border-radius: 4px; font-size: 0.85em; color: #bfdbfe;">
+                                <strong>💡 Note:</strong> Downloads discovered API endpoints and OpenAPI specifications found in your codebase.
+                            </div>
+                        </div>
+                        
+                        <div class="stats-detail-box">
+                            <h4>🌐 API Discovery Statistics</h4>
+                            <div class="stats-grid-small">
+                                <div class="stat-item"><strong>OpenAPI/Swagger:</strong> ${API_OPENAPI_COUNT}</div>
+                                <div class="stat-item"><strong>Python Routes:</strong> ${API_PYTHON_COUNT}</div>
+                                <div class="stat-item"><strong>Node.js Routes:</strong> ${API_NODEJS_COUNT}</div>
+                                <div class="stat-item"><strong>Java Endpoints:</strong> ${API_JAVA_COUNT}</div>
+                                <div class="stat-item"><strong>GraphQL Schemas:</strong> ${API_GRAPHQL_COUNT}</div>
+                                <div class="stat-item"><strong>Documentation:</strong> ${API_DOCS_COUNT}</div>
+                            </div>
+                        </div>
+EOF
+
+# Add discovered endpoints list
+if [ "$API_PYTHON_COUNT" -gt 0 ]; then
+    cat >> "$OUTPUT_HTML" << 'EOF'
+                        <div class="stats-detail-box" style="margin-top: 15px;">
+                            <h4>🔍 Discovered API Endpoints</h4>
+EOF
+    
+    # Parse Python routes from JSON
+    if [ -f "$API_DISC_FILE" ]; then
+        endpoints=$(jq -r '.discovery_methods.code_routes.python[]? | "\(.method)|\(.path)|\(.name // .function // "")|\(.auth // "None")|\(.tags // "")|\(.framework)|\(.file)"' "$API_DISC_FILE" 2>/dev/null)
+        
+        if [ -n "$endpoints" ]; then
+            cat >> "$OUTPUT_HTML" << 'EOF'
+                            <div style="max-height: 500px; overflow-y: auto; border: 1px solid #e2e8f0; border-radius: 8px; padding: 10px;">
+                                <table id="apiEndpointsTable" style="width: 100%; border-collapse: collapse; font-size: 0.9em;">
+                                    <thead style="position: sticky; top: 0; background: #1e2530; border-bottom: 2px solid #374151;">
+                                        <tr>
+                                            <th onclick="sortAPITable(0)" style="padding: 10px; text-align: left; font-weight: 600; color: #2d3748; width: 80px; cursor: pointer; user-select: none;" title="Click to sort">Method <span class="sort-indicator">⇅</span></th>
+                                            <th onclick="sortAPITable(1)" style="padding: 10px; text-align: left; font-weight: 600; color: #2d3748; width: 250px; cursor: pointer; user-select: none;" title="Click to sort">Endpoint <span class="sort-indicator">⇅</span></th>
+                                            <th onclick="sortAPITable(2)" style="padding: 10px; text-align: left; font-weight: 600; color: #2d3748; width: 200px; cursor: pointer; user-select: none;" title="Click to sort">Name <span class="sort-indicator">⇅</span></th>
+                                            <th onclick="sortAPITable(3)" style="padding: 10px; text-align: left; font-weight: 600; color: #2d3748; width: 150px; cursor: pointer; user-select: none;" title="Click to sort">Authentication <span class="sort-indicator">⇅</span></th>
+                                            <th onclick="sortAPITable(4)" style="padding: 10px; text-align: left; font-weight: 600; color: #2d3748; width: 120px; cursor: pointer; user-select: none;" title="Click to sort">Tags <span class="sort-indicator">⇅</span></th>
+                                            <th onclick="sortAPITable(5)" style="padding: 10px; text-align: left; font-weight: 600; color: #2d3748; width: 100px; cursor: pointer; user-select: none;" title="Click to sort">Framework <span class="sort-indicator">⇅</span></th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+EOF
+            
+            # Output each endpoint as a table row
+            echo "$endpoints" | while IFS='|' read -r method path name auth tags framework file; do
+                if [ -n "$method" ] && [ -n "$path" ]; then
+                    # Determine method badge color
+                    method_color="#10b981"  # green for GET
+                    case "$method" in
+                        POST) method_color="#3b82f6" ;;    # blue
+                        PUT) method_color="#f59e0b" ;;     # orange
+                        DELETE) method_color="#ef4444" ;;  # red
+                        PATCH) method_color="#8b5cf6" ;;   # purple
+                        ANY) method_color="#6b7280" ;;     # gray for Django ANY
+                    esac
+                    
+                    # Determine auth badge color
+                    auth_color="#6b7280"  # gray for None
+                    auth_display="$auth"
+                    if [ "$auth" != "None" ] && [ -n "$auth" ]; then
+                        auth_color="#f59e0b"  # orange for auth required
+                        auth_display="🔒 $auth"
+                    fi
+                    
+                    # Display name or fallback to path
+                    display_name="$name"
+                    if [ -z "$display_name" ] || [ "$display_name" = "null" ]; then
+                        display_name="—"
+                    fi
+                    
+                    # Display tags or dash
+                    display_tags="$tags"
+                    if [ -z "$display_tags" ] || [ "$display_tags" = "null" ]; then
+                        display_tags="—"
+                    fi
+                    
+                    # Extract just the filename from full path for tooltip
+                    filename=$(basename "$file" 2>/dev/null || echo "$file")
+                    
+                    cat >> "$OUTPUT_HTML" << EOF_ENDPOINT
+                                        <tr style="border-bottom: 1px solid #e2e8f0;">
+                                            <td style="padding: 10px;">
+                                                <span style="display: inline-block; padding: 4px 10px; background: ${method_color}; color: white; border-radius: 4px; font-weight: 600; font-size: 0.85em; min-width: 60px; text-align: center;">${method}</span>
+                                            </td>
+                                            <td style="padding: 10px;">
+                                                <div style="font-family: monospace; color: #2563eb; font-weight: 500;">${path}</div>
+                                                <div style="font-size: 0.75em; color: #6b7280; margin-top: 2px;" title="${file}">${filename}</div>
+                                            </td>
+                                            <td style="padding: 10px; color: #374151;">${display_name}</td>
+                                            <td style="padding: 10px;">
+                                                <span style="display: inline-block; padding: 3px 8px; background: ${auth_color}; color: white; border-radius: 4px; font-size: 0.8em;">${auth_display}</span>
+                                            </td>
+                                            <td style="padding: 10px; font-size: 0.85em; color: #6b7280;">${display_tags}</td>
+                                            <td style="padding: 10px;">
+                                                <span style="display: inline-block; padding: 3px 8px; background: #e5e7eb; color: #374151; border-radius: 4px; font-size: 0.8em;">${framework}</span>
+                                            </td>
+                                        </tr>
+EOF_ENDPOINT
+                fi
+            done
+            
+            cat >> "$OUTPUT_HTML" << 'EOF'
+                                    </tbody>
+                                </table>
+                            </div>
+EOF
+        fi
+    fi
+    
+    cat >> "$OUTPUT_HTML" << 'EOF'
+                        </div>
+EOF
+fi
+
+cat >> "$OUTPUT_HTML" << EOF
+                        ${API_FINDINGS}
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="footer">
+            <p style="color: #718096; margin-bottom: 10px;">
+                Comprehensive Security Architecture Scanner • v${BARBATOS_VERSION}
+            </p>
+            <p style="color: #a0aec0; font-size: 0.9em;">
+                Total Findings: <strong style="color: #2d3748;">${TOTAL_FINDINGS}</strong> • 
+                Tools: <strong style="color: #2d3748;">12</strong> • 
+                Files Scanned: <strong style="color: #2d3748;">${CLAMAV_FILES_SCANNED}</strong> •
+                Images Scanned: <strong style="color: #2d3748;">${TRIVY_IMAGES_SCANNED}</strong>
+            </p>
+            <div class="footer-links">
+                <a href="../index.html" class="footer-link">📄 All Reports</a>
+                <a href="../raw-data/" class="footer-link">📊 Raw Data</a>
+                <a href="../markdown-reports/" class="footer-link">📝 Markdown</a>
+            </div>
+            <div>
+                <button class="footer-metrics-btn" onclick="openMetricsModal()" id="metricsBtn">
+                    📊 Metrics
+                </button>
+                <button class="footer-manifest-btn" onclick="openScanManifestModal()" id="scanManifestBtn">
+                    🔏 Scan Manifest
+                </button>
+            </div>
+        </div>
+
+        <!-- Scan Manifest Modal -->
+        <div class="manifest-modal-overlay" id="scanManifestOverlay" onclick="closeScanManifestModalOnOverlay(event)">
+            <div class="manifest-modal" id="scanManifestModal">
+                <div class="manifest-modal-header">
+                    <h2 class="manifest-modal-title">🔏 Scan Manifest</h2>
+                    <button class="manifest-modal-close" onclick="closeScanManifestModal()" title="Close">✕</button>
+                </div>
+                <div class="manifest-modal-body" id="scanManifestBody">
+                    <p class="manifest-no-data">Loading...</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Metrics Modal -->
+        <div class="metrics-modal-overlay" id="metricsOverlay" onclick="closeMetricsModalOnOverlay(event)">
+            <div class="metrics-modal" id="metricsModal">
+                <div class="metrics-modal-header">
+                    <h2 class="metrics-modal-title">📊 Vulnerability Metrics</h2>
+                    <button class="metrics-modal-close" onclick="closeMetricsModal()" title="Close">✕</button>
+                </div>
+                <div class="metrics-modal-body" id="metricsModalBody">
+                    <!-- Metrics content will be injected here -->
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Embedded SBOM data for offline downloads
+        const embeddedSBOMs = {};
+        const embeddedAPIDiscovery = null;
+        
+        // Scan manifest data (embedded at dashboard generation time)
+        const scanManifestData = ${SCAN_MANIFEST_JSON};
+        
+        // ----- Scan Manifest Modal -----
+        function openScanManifestModal() {
+            renderScanManifestModal();
+            document.getElementById('scanManifestOverlay').classList.add('open');
+            document.body.style.overflow = 'hidden';
+        }
+        
+        function closeScanManifestModal() {
+            document.getElementById('scanManifestOverlay').classList.remove('open');
+            document.body.style.overflow = '';
+        }
+        
+        function closeScanManifestModalOnOverlay(event) {
+            if (event.target === document.getElementById('scanManifestOverlay')) {
+                closeScanManifestModal();
+            }
+        }
+        
+        function renderScanManifestModal() {
+            const body = document.getElementById('scanManifestBody');
+            if (!scanManifestData) {
+                body.innerHTML = '<p class="manifest-no-data">No scan manifest available for this scan. Run <code>generate-scan-manifest.sh</code> to create one.</p>';
+                return;
+            }
+            
+            const m = scanManifestData;
+            const meta = m.scan_metadata || {};
+            const target = m.target || {};
+            const tools = m.tools || {};
+            const hashes = m.file_hashes || {};
+            const hashKeys = Object.keys(hashes);
+            
+            let html = '';
+            
+            // Integrity badge
+            html += '<div class="manifest-integrity-badge">✅ SHA-256 File Hashes Tracked — ' + hashKeys.length + ' file' + (hashKeys.length !== 1 ? 's' : '') + ' hashed</div>';
+            
+            // Scan Metadata
+            html += '<div class="manifest-section">';
+            html += '<div class="manifest-section-title">Scan Metadata</div>';
+            html += '<div class="manifest-kv-grid">';
+            html += '<span class="manifest-key">Scan ID</span><span class="manifest-value">' + esc(meta.scan_id) + '</span>';
+            html += '<span class="manifest-key">Timestamp</span><span class="manifest-value">' + esc(meta.timestamp || m.generated_at) + '</span>';
+            html += '<span class="manifest-key">User</span><span class="manifest-value">' + esc(meta.username) + '</span>';
+            html += '<span class="manifest-key">Host</span><span class="manifest-value">' + esc(meta.hostname) + '</span>';
+            html += '<span class="manifest-key">BARBATOS Version</span><span class="manifest-value">' + esc(meta.barbatos_version) + '</span>';
+            html += '<span class="manifest-key">Manifest Version</span><span class="manifest-value">' + esc(m.manifest_version) + '</span>';
+            if (m.manifest_hash) {
+                html += '<span class="manifest-key">Manifest Hash</span><span class="manifest-value">' + esc(m.manifest_hash) + '</span>';
+            }
+            html += '</div></div>';
+            
+            // Target
+            if (target.repository || target.commit_sha || target.branch) {
+                html += '<div class="manifest-section">';
+                html += '<div class="manifest-section-title">Target</div>';
+                html += '<div class="manifest-kv-grid">';
+                if (target.repository) html += '<span class="manifest-key">Repository</span><span class="manifest-value">' + esc(target.repository) + '</span>';
+                if (target.commit_sha) html += '<span class="manifest-key">Commit SHA</span><span class="manifest-value">' + esc(target.commit_sha) + '</span>';
+                if (target.branch) html += '<span class="manifest-key">Branch</span><span class="manifest-value">' + esc(target.branch) + '</span>';
+                if (target.subdirectory) html += '<span class="manifest-key">Subdirectory</span><span class="manifest-value">' + esc(target.subdirectory) + '</span>';
+                html += '</div></div>';
+            }
+            
+            // Tool Versions
+            const toolKeys = Object.keys(tools);
+            if (toolKeys.length > 0) {
+                html += '<div class="manifest-section">';
+                html += '<div class="manifest-section-title">Tool Versions</div>';
+                html += '<div class="manifest-kv-grid">';
+                toolKeys.forEach(function(tool) {
+                    html += '<span class="manifest-key">' + esc(tool) + '</span><span class="manifest-value">' + esc(String(tools[tool])) + '</span>';
+                });
+                html += '</div></div>';
+            }
+            
+            // File Hashes
+            if (hashKeys.length > 0) {
+                html += '<div class="manifest-section">';
+                html += '<div class="manifest-section-title">File Hashes (' + hashKeys.length + ')</div>';
+                html += '<div class="manifest-file-list">';
+                hashKeys.sort().forEach(function(file) {
+                    html += '<div class="manifest-file-item">';
+                    html += '<span class="manifest-file-name">' + esc(file) + '</span>';
+                    html += '<span class="manifest-file-hash">' + esc(String(hashes[file])) + '</span>';
+                    html += '</div>';
+                });
+                html += '</div></div>';
+            }
+            
+            body.innerHTML = html;
+        }
+        
+        function esc(val) {
+            if (val === null || val === undefined) return '<span style="color:#6b7280">N/A</span>';
+            return String(val)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;');
+        }
+        
+        // Disable manifest button if no data
+        document.addEventListener('DOMContentLoaded', function() {
+            if (!scanManifestData) {
+                var btn = document.getElementById('scanManifestBtn');
+                if (btn) btn.disabled = true;
+            }
+        });
+
+        // Close modal on Escape key
+        document.addEventListener('keydown', function(e) {
+            if (e.key === 'Escape') {
+                closeScanManifestModal();
+                closeMetricsModal();
+            }
+        });
+
+        // ----- Metrics Modal -----
+        function openMetricsModal() {
+            document.getElementById('metricsOverlay').classList.add('open');
+            document.body.style.overflow = 'hidden';
+        }
+
+        function closeMetricsModal() {
+            document.getElementById('metricsOverlay').classList.remove('open');
+            document.body.style.overflow = '';
+        }
+
+        function closeMetricsModalOnOverlay(event) {
+            if (event.target === document.getElementById('metricsOverlay')) {
+                closeMetricsModal();
+            }
+        }
+
+        // Current filter state
+        let currentFilter = 'all';
+        let currentSourceFilter = 'all';
+        let currentSort = 'severity';
+        
+        // Severity priority for sorting
+        const severityOrder = { 'critical': 0, 'high': 1, 'medium': 2, 'low': 3 };
+        
+        function toggleTool(toolId) {
+            const header = document.querySelector('#' + toolId + '-content').previousElementSibling;
+            const content = document.getElementById(toolId + '-content');
+            
+            // Close all other tools
+            document.querySelectorAll('.tool-header').forEach(h => {
+                if (h !== header) {
+                    h.classList.remove('active');
+                }
+            });
+            document.querySelectorAll('.tool-content').forEach(c => {
+                if (c !== content) {
+                    c.classList.remove('active');
+                }
+            });
+            
+            // Toggle current tool
+            header.classList.toggle('active');
+            content.classList.toggle('active');
+        }
+        
+        // Toggle individual finding details
+        function toggleFindingDetails(element) {
+            event.stopPropagation();
+            
+            // Don't toggle if user is selecting text
+            const selection = window.getSelection();
+            if (selection.toString().length > 0) {
+                return;
+            }
+            
+            // Don't toggle if clicking on links, buttons, or interactive elements
+            if (event.target.tagName === 'A' || event.target.tagName === 'BUTTON' || event.target.tagName === 'INPUT') {
+                return;
+            }
+            
+            const details = element.querySelector('.finding-details');
+            const isExpanded = details.style.display === 'block';
+            
+            // If clicking inside an already expanded details section, don't toggle
+            if (isExpanded && event.target.closest('.finding-details')) {
+                return;
+            }
+            
+            // Collapse all other findings in the same tool section (or probe-family group)
+            const parent = element.closest('.garak-probe-body') || element.closest('.tool-findings');
+            if (parent) {
+                parent.querySelectorAll('.finding-details').forEach(d => {
+                    d.style.display = 'none';
+                });
+                parent.querySelectorAll('.finding-item').forEach(f => {
+                    f.classList.remove('expanded');
+                });
+            }
+            
+            // Toggle this finding
+            if (!isExpanded) {
+                details.style.display = 'block';
+                element.classList.add('expanded');
+                element.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+            }
+        }
+        
+        // Toggle suppressed findings table visibility
+        function toggleSuppressedTable() {
+            const table = document.getElementById('suppressedTable');
+            const icon = document.getElementById('toggleSuppressedIcon');
+            
+            if (table.style.display === 'none') {
+                table.style.display = 'block';
+                icon.textContent = '▲';
+            } else {
+                table.style.display = 'none';
+                icon.textContent = '▼';
+            }
+        }
+        
+        // Filter findings by severity
+        function filterBySeverity(severity) {
+            currentFilter = severity;
+            
+            // Update chip active states
+            document.querySelectorAll('.filter-chip').forEach(chip => {
+                chip.classList.remove('active');
+            });
+            document.querySelector('.filter-chip-' + severity).classList.add('active');
+            
+            // Get all finding items
+            const findings = document.querySelectorAll('.finding-item');
+            let visibleCount = 0;
+            
+            findings.forEach(finding => {
+                const findingSource = finding.dataset.source || 'app';
+                
+                // Check both severity filter and source filter
+                let passesSeverityFilter = (severity === 'all') || finding.classList.contains('severity-' + severity);
+                let passesSourceFilter = (typeof currentSourceFilter === 'undefined' || currentSourceFilter === 'all') || (findingSource === currentSourceFilter);
+                
+                if (passesSeverityFilter && passesSourceFilter) {
+                    finding.classList.remove('filtered-out');
+                    visibleCount++;
+                } else {
+                    finding.classList.add('filtered-out');
+                }
+            });
+            
+            // Update tool card opacity based on visible findings
+            document.querySelectorAll('.tool-card').forEach(card => {
+                const visibleInCard = card.querySelectorAll('.finding-item:not(.filtered-out)').length;
+                if ((severity !== 'all' || (typeof currentSourceFilter !== 'undefined' && currentSourceFilter !== 'all')) && visibleInCard === 0) {
+                    card.classList.add('filtered-out');
+                } else {
+                    card.classList.remove('filtered-out');
+                }
+            });
+            
+            // Show/hide filter results bar
+            const resultsBar = document.getElementById('filter-results');
+            const countSpan = document.getElementById('filter-count');
+            const srcFilter = (typeof currentSourceFilter !== 'undefined') ? currentSourceFilter : 'all';
+            
+            if (severity === 'all' && srcFilter === 'all') {
+                resultsBar.style.display = 'none';
+            } else {
+                resultsBar.style.display = 'flex';
+                let filterText = 'Showing ' + visibleCount + ' findings';
+                if (severity !== 'all') filterText += ' (' + severity.toUpperCase() + ')';
+                if (srcFilter !== 'all') filterText += ' from ' + (srcFilter === 'image' ? 'Container Image' : 'Application Code');
+                countSpan.textContent = filterText;
+            }
+            
+            // Expand tools with visible findings
+            if (severity !== 'all') {
+                document.querySelectorAll('.tool-card:not(.filtered-out)').forEach(card => {
+                    const content = card.querySelector('.tool-content');
+                    const header = card.querySelector('.tool-header');
+                    if (content && !content.classList.contains('active')) {
+                        header.classList.add('active');
+                        content.classList.add('active');
+                    }
+                });
+            }
+        }
+        
+        // Filter findings by source (container image vs application code)
+        function filterBySource(source) {
+            currentSourceFilter = source;
+            
+            // Update source chip active states
+            document.querySelectorAll('.source-chip').forEach(chip => {
+                chip.classList.remove('active');
+            });
+            document.querySelector('.source-chip-' + source).classList.add('active');
+            
+            // Get all finding items
+            const findings = document.querySelectorAll('.finding-item');
+            let visibleCount = 0;
+            
+            findings.forEach(finding => {
+                const findingSource = finding.dataset.source || 'app';
+                
+                // Check both severity filter and source filter
+                let passesSourceFilter = (source === 'all') || (findingSource === source);
+                let passesSeverityFilter = (currentFilter === 'all') || finding.classList.contains('severity-' + currentFilter);
+                
+                if (passesSourceFilter && passesSeverityFilter) {
+                    finding.classList.remove('filtered-out');
+                    visibleCount++;
+                } else {
+                    finding.classList.add('filtered-out');
+                }
+            });
+            
+            // Update tool card opacity based on visible findings
+            document.querySelectorAll('.tool-card').forEach(card => {
+                const visibleInCard = card.querySelectorAll('.finding-item:not(.filtered-out)').length;
+                if ((source !== 'all' || currentFilter !== 'all') && visibleInCard === 0) {
+                    card.classList.add('filtered-out');
+                } else {
+                    card.classList.remove('filtered-out');
+                }
+            });
+            
+            // Show/hide filter results bar
+            const resultsBar = document.getElementById('filter-results');
+            const countSpan = document.getElementById('filter-count');
+            
+            if (source === 'all' && currentFilter === 'all') {
+                resultsBar.style.display = 'none';
+            } else {
+                resultsBar.style.display = 'flex';
+                let filterText = 'Showing ' + visibleCount + ' findings';
+                if (source !== 'all') filterText += ' from ' + (source === 'image' ? 'Container Image' : 'Application Code');
+                if (currentFilter !== 'all') filterText += ' (' + currentFilter.toUpperCase() + ')';
+                countSpan.textContent = filterText;
+            }
+        }
+        
+        // Sort findings within each tool
+        function sortFindings(sortType) {
+            currentSort = sortType;
+            
+            // Update sort button states
+            document.querySelectorAll('.sort-btn').forEach(btn => btn.classList.remove('active'));
+            document.getElementById('sort-' + sortType).classList.add('active');
+            
+            // Get all tool finding containers
+            document.querySelectorAll('.tool-findings').forEach(container => {
+                const findings = Array.from(container.querySelectorAll('.finding-item'));
+                
+                if (findings.length === 0) return;
+                
+                // Sort based on type
+                if (sortType === 'severity') {
+                    findings.sort((a, b) => {
+                        const aSeverity = getSeverityFromClasses(a.classList);
+                        const bSeverity = getSeverityFromClasses(b.classList);
+                        return severityOrder[aSeverity] - severityOrder[bSeverity];
+                    });
+                } else if (sortType === 'tool') {
+                    // Already grouped by tool, so just sort by tool badge text
+                    findings.sort((a, b) => {
+                        const aTool = a.querySelector('.badge-tool')?.textContent || '';
+                        const bTool = b.querySelector('.badge-tool')?.textContent || '';
+                        return aTool.localeCompare(bTool);
+                    });
+                }
+                
+                // Re-append in sorted order (moves elements)
+                findings.forEach(finding => container.appendChild(finding));
+            });
+        }
+        
+        // Helper to get severity from class list
+        function getSeverityFromClasses(classList) {
+            if (classList.contains('severity-critical')) return 'critical';
+            if (classList.contains('severity-high')) return 'high';
+            if (classList.contains('severity-medium')) return 'medium';
+            if (classList.contains('severity-low')) return 'low';
+            return 'low';
+        }
+        
+        // Click on stat cards to filter
+        document.querySelectorAll('.stat-card').forEach(card => {
+            card.style.cursor = 'pointer';
+            card.addEventListener('click', () => {
+                if (card.classList.contains('critical-stat')) filterBySeverity('critical');
+                else if (card.classList.contains('high-stat')) filterBySeverity('high');
+                else if (card.classList.contains('medium-stat')) filterBySeverity('medium');
+                else if (card.classList.contains('low-stat')) filterBySeverity('low');
+            });
+        });
+        
+        // Filter SBOM packages by search term
+        let currentSBOMTypeFilter = 'all';
+        let currentSBOMSort = 'name';
+        
+        function filterSBOMPackages(searchTerm) {
+            const packages = document.querySelectorAll('.sbom-package-item');
+            const term = searchTerm.toLowerCase().trim();
+            let visibleCount = 0;
+            
+            packages.forEach(pkg => {
+                const name = pkg.dataset.name || '';
+                const type = pkg.dataset.type || '';
+                const version = pkg.dataset.version || '';
+                const language = pkg.dataset.language || '';
+                
+                const matchesSearch = term === '' || 
+                    name.includes(term) || 
+                    type.toLowerCase().includes(term) || 
+                    version.toLowerCase().includes(term) ||
+                    language.toLowerCase().includes(term);
+                
+                const matchesType = currentSBOMTypeFilter === 'all' || type === currentSBOMTypeFilter;
+                
+                if (matchesSearch && matchesType) {
+                    pkg.classList.remove('filtered-out');
+                    visibleCount++;
+                } else {
+                    pkg.classList.add('filtered-out');
+                }
+            });
+            
+            updateSBOMResultsBar(visibleCount, term !== '' || currentSBOMTypeFilter !== 'all');
+        }
+        
+        // Filter SBOM by package type
+        function filterSBOMByType(button, type) {
+            currentSBOMTypeFilter = type;
+            
+            // Update active chip state
+            document.querySelectorAll('.sbom-filter-chip').forEach(chip => {
+                chip.classList.remove('active');
+            });
+            button.classList.add('active');
+            
+            // Re-apply filters
+            const searchTerm = document.getElementById('sbom-search')?.value || '';
+            filterSBOMPackages(searchTerm);
+        }
+        
+        // Sort SBOM packages
+        function sortSBOMPackages(sortBy) {
+            currentSBOMSort = sortBy;
+            
+            // Update active button
+            document.querySelectorAll('.sbom-sort-btn').forEach(btn => btn.classList.remove('active'));
+            document.getElementById('sbom-sort-' + sortBy)?.classList.add('active');
+            
+            const container = document.getElementById('sbom-package-list');
+            if (!container) return;
+            
+            const packages = Array.from(container.querySelectorAll('.sbom-package-item'));
+            
+            packages.sort((a, b) => {
+                let aVal, bVal;
+                
+                switch(sortBy) {
+                    case 'name':
+                        aVal = a.dataset.name || '';
+                        bVal = b.dataset.name || '';
+                        return aVal.localeCompare(bVal);
+                    case 'type':
+                        aVal = a.dataset.type || '';
+                        bVal = b.dataset.type || '';
+                        return aVal.localeCompare(bVal) || (a.dataset.name || '').localeCompare(b.dataset.name || '');
+                    case 'version':
+                        aVal = a.dataset.version || '0';
+                        bVal = b.dataset.version || '0';
+                        // Simple version comparison
+                        return bVal.localeCompare(aVal, undefined, {numeric: true});
+                    default:
+                        return 0;
+                }
+            });
+            
+            // Re-append in sorted order
+            packages.forEach(pkg => container.appendChild(pkg));
+        }
+        
+        // Update SBOM results bar
+        function updateSBOMResultsBar(count, hasFilter) {
+            const countEl = document.getElementById('sbom-results-count');
+            const clearEl = document.getElementById('sbom-clear-filter');
+            
+            if (countEl) {
+                let filterText = '';
+                if (currentSBOMTypeFilter !== 'all') {
+                    filterText = ' (' + currentSBOMTypeFilter + ')';
+                }
+                countEl.textContent = 'Showing ' + count + ' packages' + filterText;
+            }
+            
+            if (clearEl) {
+                clearEl.style.display = hasFilter ? 'inline' : 'none';
+            }
+        }
+        
+        // Reset SBOM filters
+        function resetSBOMFilters() {
+            currentSBOMTypeFilter = 'all';
+            
+            // Reset search
+            const searchInput = document.getElementById('sbom-search');
+            if (searchInput) searchInput.value = '';
+            
+            // Reset type filter chips
+            document.querySelectorAll('.sbom-filter-chip').forEach(chip => {
+                chip.classList.remove('active');
+                if (chip.dataset.type === 'all') chip.classList.add('active');
+            });
+            
+            // Show all packages
+            document.querySelectorAll('.sbom-package-item').forEach(pkg => {
+                pkg.classList.remove('filtered-out');
+            });
+            
+            // Update results bar
+            const totalPackages = document.querySelectorAll('.sbom-package-item').length;
+            updateSBOMResultsBar(totalPackages, false);
+        }
+        
+        // SBOM Export Function - downloads files using browser download
+        function exportSBOM(format) {
+            const statusDiv = document.getElementById('sbom-export-status');
+            const scanId = '$SCAN_NAME';
+            
+            // Define format mappings - match actual file names in sbom/exports/
+            const formats = {
+                'cyclonedx-json': { file: 'cyclonedx.json', name: 'CycloneDX JSON', tools: 'Dependency-Track, OWASP OSS Index, Snyk, JFrog Xray' },
+                'cyclonedx-xml': { file: 'cyclonedx.xml', name: 'CycloneDX XML', tools: 'Dependency-Track, JFrog Xray' },
+                'spdx-json': { file: 'spdx.json', name: 'SPDX JSON', tools: 'GitHub Dependency Graph, Snyk, BlackDuck' }
+            };
+            
+            // Show processing message
+            statusDiv.style.display = 'block';
+            statusDiv.style.background = 'linear-gradient(135deg, #065f46 0%, #064e3b 100%)';
+            statusDiv.style.border = '1px solid #10b981';
+            
+            if (format === 'all') {
+                // Download all formats
+                statusDiv.innerHTML = \`
+                    <div style="color: white;">
+                        <div style="font-size: 1.1em; margin-bottom: 12px;">
+                            <span style="margin-right: 8px;">📦</span><strong>Downloading All SBOM Formats...</strong>
+                        </div>
+                        <div style="margin: 12px 0; font-size: 0.9em; color: #d1fae5;">
+                            Your browser will prompt you to save each file.
+                        </div>
+                    </div>
+                \`;
+                
+                // Trigger download for each format
+                Object.keys(formats).forEach(fmt => {
+                    setTimeout(() => downloadSBOMFile(fmt, formats[fmt]), 500);
+                });
+                
+                setTimeout(() => {
+                    statusDiv.innerHTML = \`
+                        <div style="color: white;">
+                            <div style="font-size: 1.1em; margin-bottom: 8px;">
+                                <span style="margin-right: 8px;">✅</span><strong>SBOM Export Complete</strong>
+                            </div>
+                            <div style="font-size: 0.9em; color: #d1fae5;">
+                                All SBOM formats have been downloaded to your browser's download folder.
+                            </div>
+                        </div>
+                    \`;
+                }, 2000);
+            } else {
+                const formatInfo = formats[format];
+                if (!formatInfo) {
+                    statusDiv.style.background = 'linear-gradient(135deg, #dc2626 0%, #991b1b 100%)';
+                    statusDiv.innerHTML = '<div style="color: white;">❌ Unknown format: ' + format + '</div>';
+                    return;
+                }
+                
+                downloadSBOMFile(format, formatInfo);
+                
+                statusDiv.innerHTML = \`
+                    <div style="color: white;">
+                        <div style="font-size: 1.1em; margin-bottom: 8px;">
+                            <span style="margin-right: 8px;">✅</span><strong>\${formatInfo.name} Downloaded</strong>
+                        </div>
+                        <div style="margin: 10px 0; padding: 12px; background: rgba(0,0,0,0.2); border-radius: 6px;">
+                            <div style="font-size: 0.9em; color: #d1fae5; margin-bottom: 8px;">
+                                <strong>📄 Format:</strong> \${formatInfo.name}
+                            </div>
+                            <div style="font-size: 0.85em; color: #d1fae5;">
+                                <strong>🔧 Compatible Tools:</strong> \${formatInfo.tools}
+                            </div>
+                        </div>
+                    </div>
+                \`;
+            }
+        }
+        
+        // Helper function to download SBOM file
+        function downloadSBOMFile(format, formatInfo) {
+            const scanId = '$SCAN_NAME';
+            
+            // Check if we have embedded data first (works offline)
+            if (embeddedSBOMs && embeddedSBOMs[format]) {
+                const formatExtMap = {
+                    'cyclonedx-json': 'cyclonedx.json',
+                    'cyclonedx-xml': 'cyclonedx.xml',
+                    'spdx-json': 'spdx.json'
+                };
+                const fileExt = formatExtMap[format];
+                
+                const blob = new Blob([embeddedSBOMs[format]], { type: 'application/json' });
+                const url = window.URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.style.display = 'none';
+                a.href = url;
+                a.download = \`sbom-\${scanId}.\${fileExt}\`;
+                document.body.appendChild(a);
+                a.click();
+                window.URL.revokeObjectURL(url);
+                document.body.removeChild(a);
+                return;
+            }
+            
+            // Fallback to fetching from file system (only works when served via http)
+            const formatExtMap = {
+                'cyclonedx-json': 'cyclonedx.json',
+                'cyclonedx-xml': 'cyclonedx.xml',
+                'spdx-json': 'spdx.json'
+            };
+            
+            const fileExt = formatExtMap[format];
+            
+            // Try multiple possible locations for SBOM files
+            const possiblePaths = [
+                \`../../sbom/exports/sbom-\${scanId}.\${fileExt}\`,  // Root scan directory exports (actual location)
+                \`../raw-data/SBOM/sbom-\${scanId}.\${fileExt}\`,  // Consolidated reports with scan ID
+                \`../../sbom/sbom-\${scanId}.\${fileExt}\`,  // Root scan directory with scan ID
+                \`../raw-data/SBOM/\${formatInfo.file}\`,  // Consolidated reports location (old format)
+                \`../../sbom/\${formatInfo.file}\`,  // Root scan directory (old format)
+                \`../../consolidated-reports/raw-data/SBOM/\${formatInfo.file}\`,  // Full path from root
+                \`../../sbom/exports/\${formatInfo.file}\`  // Exports directory with old naming
+            ];
+            
+            tryDownloadSBOMFromPaths(possiblePaths, 0, formatInfo, scanId, fileExt);
+        }
+        
+        function tryDownloadSBOMFromPaths(paths, index, formatInfo, scanId, fileExt) {
+            if (index >= paths.length) {
+                const statusDiv = document.getElementById('sbom-export-status');
+                statusDiv.style.background = 'linear-gradient(135deg, #dc2626 0%, #991b1b 100%)';
+                
+                // Check if we're in file:// context
+                if (window.location.protocol === 'file:') {
+                    statusDiv.innerHTML = \`
+                        <div style="color: white;">
+                            <div style="margin-bottom: 10px;">❌ <strong>Cannot download from local file system</strong></div>
+                            <div style="font-size: 0.9em; color: #fecaca; margin-bottom: 10px;">
+                                Browser security prevents downloads when viewing HTML files locally.
+                            </div>
+                            <div style="background: rgba(0,0,0,0.3); padding: 12px; border-radius: 6px; text-align: left;">
+                                <div style="font-size: 0.9em; color: #fef3c7; margin-bottom: 8px;"><strong>📋 SBOM File Location:</strong></div>
+                                <div style="font-family: monospace; font-size: 0.85em; color: #fef3c7; background: rgba(0,0,0,0.2); padding: 8px; border-radius: 4px; margin-bottom: 10px;">
+                                    sbom/exports/sbom-\${scanId}.\${fileExt}
+                                </div>
+                                <div style="font-size: 0.85em; color: #fecaca;">
+                                    Navigate to the extracted artifact folder and find the file in the <strong>sbom/exports/</strong> directory.
+                                </div>
+                            </div>
+                        </div>
+                    \`;
+                } else {
+                    statusDiv.innerHTML = \`
+                        <div style="color: white;">
+                            ❌ Failed to download \${formatInfo.name}. File may not exist or SBOM generation was not run.
+                        </div>
+                    \`;
+                }
+                return;
+            }
+            
+            fetch(paths[index])
+                .then(response => {
+                    if (!response.ok) throw new Error('File not found');
+                    return response.blob();
+                })
+                .then(blob => {
+                    const url = window.URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.style.display = 'none';
+                    a.href = url;
+                    a.download = \`sbom-\${scanId}.\${fileExt}\`;
+                    document.body.appendChild(a);
+                    a.click();
+                    window.URL.revokeObjectURL(url);
+                    document.body.removeChild(a);
+                })
+                .catch(error => {
+                    // Try next path
+                    tryDownloadSBOMFromPaths(paths, index + 1, formatInfo, scanId, fileExt);
+                });
+        }
+        
+        // API Export Function - downloads API discovery results
+        function exportAPI(format) {
+            const statusDiv = document.getElementById('api-export-status');
+            const scanId = '$SCAN_NAME';
+            
+            // Show processing message
+            statusDiv.style.display = 'block';
+            statusDiv.style.background = 'linear-gradient(135deg, #065f46 0%, #064e3b 100%)';
+            statusDiv.style.border = '1px solid #10b981';
+            
+            if (format === 'all') {
+                // Download all formats
+                statusDiv.innerHTML = \`
+                    <div style="color: white;">
+                        <div style="font-size: 1.1em; margin-bottom: 12px;">
+                            <span style="margin-right: 8px;">📦</span><strong>Downloading All API Exports...</strong>
+                        </div>
+                        <div style="margin: 12px 0; font-size: 0.9em; color: #d1fae5;">
+                            Your browser will prompt you to save each file.
+                        </div>
+                    </div>
+                \`;
+                
+                // Download JSON summary
+                setTimeout(() => downloadAPIFile('json'), 200);
+                
+                // Download any OpenAPI specs found
+                setTimeout(() => {
+                    const apiDir = '../raw-data/API-Discovery';
+                    fetch(\`\${apiDir}/\`)
+                        .then(response => response.text())
+                        .then(html => {
+                            // Try to find OpenAPI spec files
+                            const openApiPattern = /openapi.*\\.json|swagger.*\\.json/gi;
+                            const matches = html.match(openApiPattern) || [];
+                            matches.forEach((file, idx) => {
+                                setTimeout(() => {
+                                    downloadAPISpecFile(file);
+                                }, idx * 500);
+                            });
+                        })
+                        .catch(() => {
+                            console.log('No OpenAPI specs found');
+                        });
+                }, 500);
+                
+                setTimeout(() => {
+                    statusDiv.innerHTML = \`
+                        <div style="color: white;">
+                            <div style="font-size: 1.1em; margin-bottom: 8px;">
+                                <span style="margin-right: 8px;">✅</span><strong>API Export Complete</strong>
+                            </div>
+                            <div style="font-size: 0.9em; color: #d1fae5;">
+                                API discovery data has been downloaded to your browser's download folder.
+                            </div>
+                        </div>
+                    \`;
+                }, 2000);
+            } else if (format === 'json') {
+                downloadAPIFile('json');
+                statusDiv.innerHTML = \`
+                    <div style="color: white;">
+                        <div style="font-size: 1.1em; margin-bottom: 8px;">
+                            <span style="margin-right: 8px;">✅</span><strong>API Discovery JSON Downloaded</strong>
+                        </div>
+                        <div style="margin: 10px 0; padding: 12px; background: rgba(0,0,0,0.2); border-radius: 6px;">
+                            <div style="font-size: 0.9em; color: #d1fae5;">
+                                Complete API discovery results including all discovered endpoints and routes.
+                            </div>
+                        </div>
+                    </div>
+                \`;
+            } else if (format === 'openapi') {
+                const apiDir = '../raw-data/API-Discovery';
+                fetch(\`\${apiDir}/\`)
+                    .then(response => response.text())
+                    .then(html => {
+                        const openApiPattern = /openapi.*\\.json|swagger.*\\.json/gi;
+                        const matches = html.match(openApiPattern) || [];
+                        
+                        if (matches.length === 0) {
+                            statusDiv.style.background = 'linear-gradient(135deg, #92400e 0%, #78350f 100%)';
+                            statusDiv.innerHTML = \`
+                                <div style="color: white;">
+                                    ⚠️ No OpenAPI specifications found in this scan.
+                                </div>
+                            \`;
+                            return;
+                        }
+                        
+                        matches.forEach((file, idx) => {
+                            setTimeout(() => downloadAPISpecFile(file), idx * 500);
+                        });
+                        
+                        statusDiv.innerHTML = \`
+                            <div style="color: white;">
+                                <div style="font-size: 1.1em; margin-bottom: 8px;">
+                                    <span style="margin-right: 8px;">✅</span><strong>OpenAPI Specs Downloaded</strong>
+                                </div>
+                                <div style="margin: 10px 0; padding: 12px; background: rgba(0,0,0,0.2); border-radius: 6px;">
+                                    <div style="font-size: 0.9em; color: #d1fae5;">
+                                        Downloaded \${matches.length} OpenAPI specification(s).
+                                    </div>
+                                </div>
+                            </div>
+                        \`;
+                    })
+                    .catch(error => {
+                        statusDiv.style.background = 'linear-gradient(135deg, #dc2626 0%, #991b1b 100%)';
+                        statusDiv.innerHTML = \`
+                            <div style="color: white;">
+                                ❌ Failed to find OpenAPI specifications.
+                            </div>
+                        \`;
+                    });
+            }
+        }
+        
+        // Helper function to download API discovery file
+        function downloadAPIFile(format) {
+            const scanId = '$SCAN_NAME';
+            
+            // Check if we have embedded data first (works offline)
+            if (embeddedAPIDiscovery) {
+                const blob = new Blob([embeddedAPIDiscovery], { type: 'application/json' });
+                const url = window.URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.style.display = 'none';
+                a.href = url;
+                a.download = \`api-discovery-\${scanId}.json\`;
+                document.body.appendChild(a);
+                a.click();
+                window.URL.revokeObjectURL(url);
+                document.body.removeChild(a);
+                return;
+            }
+            
+            // Fallback to fetching from file system (only works when served via http)
+            // Try multiple possible locations for API discovery file
+            const possiblePaths = [
+                '../../api-discovery.json',  // Root of scan directory
+                '../raw-data/API-Discovery/api-discovery.json',  // Consolidated reports
+                '../../api-discovery-exports/api-discovery.json'  // Exports directory
+            ];
+            
+            tryDownloadFromPaths(possiblePaths, 0, scanId);
+        }
+        
+        function tryDownloadFromPaths(paths, index, scanId) {
+            if (index >= paths.length) {
+                const statusDiv = document.getElementById('api-export-status');
+                statusDiv.style.background = 'linear-gradient(135deg, #dc2626 0%, #991b1b 100%)';
+                
+                // Check if we're in file:// context
+                if (window.location.protocol === 'file:') {
+                    statusDiv.innerHTML = \`
+                        <div style="color: white;">
+                            <div style="margin-bottom: 10px;">❌ <strong>Cannot download from local file system</strong></div>
+                            <div style="font-size: 0.9em; color: #fecaca; margin-bottom: 10px;">
+                                Browser security prevents downloads when viewing HTML files locally.
+                            </div>
+                            <div style="background: rgba(0,0,0,0.3); padding: 12px; border-radius: 6px; text-align: left;">
+                                <div style="font-size: 0.9em; color: #fef3c7; margin-bottom: 8px;"><strong>📋 API Discovery File Location:</strong></div>
+                                <div style="font-family: monospace; font-size: 0.85em; color: #fef3c7; background: rgba(0,0,0,0.2); padding: 8px; border-radius: 4px; margin-bottom: 10px;">
+                                    api-discovery.json
+                                </div>
+                                <div style="font-size: 0.85em; color: #fecaca;">
+                                    Navigate to the extracted artifact folder root to find this file.
+                                </div>
+                            </div>
+                        </div>
+                    \`;
+                } else {
+                    statusDiv.innerHTML = \`
+                        <div style="color: white;">
+                            ❌ Failed to download API discovery results. File may not exist or API discovery was not run.
+                        </div>
+                    \`;
+                }
+                return;
+            }
+            
+            fetch(paths[index])
+                .then(response => {
+                    if (!response.ok) throw new Error('File not found');
+                    return response.blob();
+                })
+                .then(blob => {
+                    const url = window.URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.style.display = 'none';
+                    a.href = url;
+                    a.download = \`api-discovery-\${scanId}.json\`;
+                    document.body.appendChild(a);
+                    a.click();
+                    window.URL.revokeObjectURL(url);
+                    document.body.removeChild(a);
+                })
+                .catch(error => {
+                    // Try next path
+                    tryDownloadFromPaths(paths, index + 1, scanId);
+                });
+        }
+        
+        // Helper function to download OpenAPI spec file
+        function downloadAPISpecFile(filename) {
+            const scanId = '$SCAN_NAME';
+            
+            // Try multiple possible locations
+            const possibleDirs = [
+                '../../api-discovery-exports',
+                '../raw-data/API-Discovery',
+                '../../'
+            ];
+            
+            tryDownloadSpecFromDirs(possibleDirs, 0, filename, scanId);
+        }
+        
+        function tryDownloadSpecFromDirs(dirs, index, filename, scanId) {
+            if (index >= dirs.length) {
+                console.error('OpenAPI spec not found:', filename);
+                return;
+            }
+            
+            fetch(\`\${dirs[index]}/\${filename}\`)
+                .then(response => {
+                    if (!response.ok) throw new Error('File not found');
+                    return response.blob();
+                })
+                .then(blob => {
+                    const url = window.URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.style.display = 'none';
+                    a.href = url;
+                    a.download = \`\${scanId}-\${filename}\`;
+                    document.body.appendChild(a);
+                    a.click();
+                    window.URL.revokeObjectURL(url);
+                    document.body.removeChild(a);
+                })
+                .catch(error => {
+                    // Try next directory
+                    tryDownloadSpecFromDirs(dirs, index + 1, filename, scanId);
+                });
+        }
+        
+        // Trivy-specific filters
+        let currentTrivyStatusFilter = 'all';
+        let currentTrivySearchTerm = '';
+
+        let currentAnchorContainerFilter = 'all';
+        let currentAnchoreSearchTerm = '';
+
+        function filterAnchoreByContainer(container, btn) {
+            currentAnchorContainerFilter = container;
+            const anchoreContent = document.getElementById('anchore-content');
+            if (anchoreContent) {
+                anchoreContent.querySelectorAll('.anchore-controls .filter-chip').forEach(b => b.classList.remove('active'));
+            }
+            if (btn) btn.classList.add('active');
+            applyAnchoreFilters();
+        }
+
+        function filterAnchoreBySearch(searchTerm) {
+            currentAnchoreSearchTerm = searchTerm.toLowerCase().trim();
+            applyAnchoreFilters();
+        }
+
+        function applyAnchoreFilters() {
+            const anchoreContent = document.getElementById('anchore-content');
+            if (!anchoreContent) return;
+            const findings = anchoreContent.querySelectorAll('.finding-item');
+            findings.forEach(finding => {
+                const container = (finding.dataset.container || '').toLowerCase();
+                const cve = (finding.dataset.cve || finding.querySelector('.finding-header .badge:nth-child(3)')?.textContent || '').toLowerCase();
+                const text = (finding.textContent || '').toLowerCase();
+
+                const matchContainer = currentAnchorContainerFilter === 'all' ||
+                    container === currentAnchorContainerFilter.toLowerCase();
+                const matchSearch = !currentAnchoreSearchTerm ||
+                    cve.includes(currentAnchoreSearchTerm) ||
+                    text.includes(currentAnchoreSearchTerm);
+
+                if (matchContainer && matchSearch) {
+                    finding.classList.remove('filtered-out');
+                } else {
+                    finding.classList.add('filtered-out');
+                }
+            });
+        }
+        
+        function filterTrivyByStatus(status) {
+            currentTrivyStatusFilter = status;
+            
+            // Update button states in trivy section
+            const trivyContent = document.getElementById('trivy-content');
+            if (trivyContent) {
+                trivyContent.querySelectorAll('.trivy-controls .filter-chip').forEach(btn => {
+                    btn.classList.remove('active');
+                });
+                event.target.classList.add('active');
+            }
+            
+            applyTrivyFilters();
+        }
+        
+        function filterTrivyBySearch(searchTerm) {
+            currentTrivySearchTerm = searchTerm.toLowerCase().trim();
+            applyTrivyFilters();
+        }
+        
+        function applyTrivyFilters() {
+            const trivyContent = document.getElementById('trivy-content');
+            if (!trivyContent) return;
+            
+            const findings = trivyContent.querySelectorAll('.finding-item');
+            let visibleCount = 0;
+            
+            findings.forEach(finding => {
+                let showByStatus = true;
+                let showBySearch = true;
+                
+                // Check status filter
+                if (currentTrivyStatusFilter !== 'all') {
+                    const status = finding.dataset.status || '';
+                    if (currentTrivyStatusFilter === 'fixed') {
+                        showByStatus = status === 'fixed';
+                    } else if (currentTrivyStatusFilter === 'affected') {
+                        showByStatus = status !== 'fixed';
+                    }
+                }
+                
+                // Check search filter
+                if (currentTrivySearchTerm) {
+                    const cve = (finding.dataset.cve || '').toLowerCase();
+                    const pkg = (finding.dataset.pkg || '').toLowerCase();
+                    const title = (finding.querySelector('.finding-title')?.textContent || '').toLowerCase();
+                    const desc = (finding.querySelector('.finding-desc')?.textContent || '').toLowerCase();
+                    
+                    showBySearch = cve.includes(currentTrivySearchTerm) || 
+                                   pkg.includes(currentTrivySearchTerm) ||
+                                   title.includes(currentTrivySearchTerm) ||
+                                   desc.includes(currentTrivySearchTerm);
+                }
+                
+                if (showByStatus && showBySearch) {
+                    finding.classList.remove('filtered-out');
+                    visibleCount++;
+                } else {
+                    finding.classList.add('filtered-out');
+                }
+            });
+            
+            // Show filtered count
+            console.log('Trivy filter: showing ' + visibleCount + ' of ' + findings.length);
+        }
+        
+        // Count findings by source and update the filter chips
+        function updateSourceCounts() {
+            const findings = document.querySelectorAll('.finding-item');
+            let imageCount = 0;
+            let appCount = 0;
+            
+            findings.forEach(finding => {
+                const source = finding.dataset.source || 'app';
+                if (source === 'image') {
+                    imageCount++;
+                } else {
+                    appCount++;
+                }
+            });
+            
+            document.getElementById('source-count-all').textContent = findings.length;
+            document.getElementById('source-count-image').textContent = imageCount;
+            document.getElementById('source-count-app').textContent = appCount;
+        }
+        
+        // Sort API endpoints table by column
+        let apiSortDirection = {};  // Track sort direction for each column
+        
+        function sortAPITable(columnIndex) {
+            const table = document.getElementById('apiEndpointsTable');
+            if (!table) return;
+            
+            const tbody = table.querySelector('tbody');
+            const rows = Array.from(tbody.querySelectorAll('tr'));
+            
+            // Toggle sort direction for this column
+            if (!apiSortDirection[columnIndex]) {
+                apiSortDirection[columnIndex] = 'asc';
+            } else {
+                apiSortDirection[columnIndex] = apiSortDirection[columnIndex] === 'asc' ? 'desc' : 'asc';
+            }
+            
+            const direction = apiSortDirection[columnIndex];
+            
+            // Sort rows
+            rows.sort((a, b) => {
+                let aValue = '';
+                let bValue = '';
+                
+                // Get text content based on column
+                const aCells = a.querySelectorAll('td');
+                const bCells = b.querySelectorAll('td');
+                
+                if (columnIndex === 0) {
+                    // Method - sort by badge text
+                    aValue = aCells[0]?.querySelector('span')?.textContent || '';
+                    bValue = bCells[0]?.querySelector('span')?.textContent || '';
+                } else if (columnIndex === 1) {
+                    // Endpoint - sort by path (first div)
+                    aValue = aCells[1]?.querySelector('div')?.textContent || '';
+                    bValue = bCells[1]?.querySelector('div')?.textContent || '';
+                } else if (columnIndex === 2) {
+                    // Name
+                    aValue = aCells[2]?.textContent.trim() || '';
+                    bValue = bCells[2]?.textContent.trim() || '';
+                } else if (columnIndex === 3) {
+                    // Authentication - sort by badge text (strip emoji)
+                    aValue = aCells[3]?.querySelector('span')?.textContent.replace('🔒', '').trim() || '';
+                    bValue = bCells[3]?.querySelector('span')?.textContent.replace('🔒', '').trim() || '';
+                } else if (columnIndex === 4) {
+                    // Tags
+                    aValue = aCells[4]?.textContent.trim() || '';
+                    bValue = bCells[4]?.textContent.trim() || '';
+                } else if (columnIndex === 5) {
+                    // Framework
+                    aValue = aCells[5]?.querySelector('span')?.textContent || '';
+                    bValue = bCells[5]?.querySelector('span')?.textContent || '';
+                }
+                
+                // Handle dashes as empty for sorting
+                if (aValue === '—') aValue = '';
+                if (bValue === '—') bValue = '';
+                
+                // Natural sort comparison
+                const comparison = aValue.localeCompare(bValue, undefined, { numeric: true, sensitivity: 'base' });
+                
+                return direction === 'asc' ? comparison : -comparison;
+            });
+            
+            // Re-append sorted rows
+            rows.forEach(row => tbody.appendChild(row));
+            
+            // Update sort indicators
+            const headers = table.querySelectorAll('th');
+            headers.forEach((header, idx) => {
+                const indicator = header.querySelector('.sort-indicator');
+                if (indicator) {
+                    if (idx === columnIndex) {
+                        indicator.textContent = direction === 'asc' ? '▲' : '▼';
+                        indicator.style.opacity = '1';
+                    } else {
+                        indicator.textContent = '⇅';
+                        indicator.style.opacity = '0.3';
+                    }
+                }
+            });
+        }
+        
+        // ── Severity Donut Chart ──────────────────────────
+        function initSeverityDonut() {
+            const canvas = document.getElementById('severity-donut');
+            if (!canvas || !canvas.getContext) return;
+            const ctx = canvas.getContext('2d');
+            const critical = parseInt(canvas.dataset.critical) || 0;
+            const high     = parseInt(canvas.dataset.high)     || 0;
+            const medium   = parseInt(canvas.dataset.medium)   || 0;
+            const low      = parseInt(canvas.dataset.low)      || 0;
+            const total    = critical + high + medium + low;
+            const cx = canvas.width / 2, cy = canvas.height / 2;
+            const outerR = 117, innerR = 75, gap = 0.05;
+            const segments = [
+                { label: 'Critical', count: critical, color: '#C41E3A' },
+                { label: 'High',     count: high,     color: '#FF1493' },
+                { label: 'Medium',   count: medium,   color: '#f97316' },
+                { label: 'Low',      count: low,      color: '#4ade80' },
+            ];
+            function draw(hovIdx) {
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                if (total === 0) {
+                    ctx.beginPath();
+                    ctx.arc(cx, cy, outerR, 0, 2 * Math.PI);
+                    ctx.arc(cx, cy, innerR, 0, 2 * Math.PI, true);
+                    ctx.fillStyle = '#374151'; ctx.fill(); return;
+                }
+                let start = -Math.PI / 2;
+                for (let i = 0; i < segments.length; i++) {
+                    const s = segments[i];
+                    if (s.count === 0) continue;
+                    const sweep = (s.count / total) * 2 * Math.PI - gap;
+                    const hov   = hovIdx === i;
+                    const r     = hov ? outerR + 7 : outerR;
+                    const sa    = start + gap / 2, ea = sa + sweep;
+                    ctx.beginPath();
+                    ctx.moveTo(cx + innerR * Math.cos(sa), cy + innerR * Math.sin(sa));
+                    ctx.arc(cx, cy, r, sa, ea);
+                    ctx.arc(cx, cy, innerR, ea, sa, true);
+                    ctx.closePath();
+                    ctx.fillStyle = hov ? s.color : s.color + 'cc';
+                    ctx.fill();
+                    if (hov) { ctx.strokeStyle = '#ffffff44'; ctx.lineWidth = 1.5; ctx.stroke(); }
+                    start += sweep + gap;
+                }
+            }
+            draw(-1);
+            const tooltip = document.getElementById('donut-tooltip');
+            function hitTest(mx, my) {
+                const rect = canvas.getBoundingClientRect();
+                const x = mx - rect.left - cx, y = my - rect.top - cy;
+                const d = Math.sqrt(x*x + y*y);
+                if (d < innerR - 2 || d > outerR + 16) return -1;
+                let a = Math.atan2(y, x) + Math.PI / 2;
+                if (a < 0) a += 2 * Math.PI;
+                let start = 0;
+                for (let i = 0; i < segments.length; i++) {
+                    if (segments[i].count === 0) continue;
+                    const sweep = (segments[i].count / total) * 2 * Math.PI;
+                    if (a >= start && a < start + sweep) return i;
+                    start += sweep;
+                }
+                return -1;
+            }
+            canvas.addEventListener('mousemove', function(e) {
+                const idx = hitTest(e.clientX, e.clientY);
+                draw(idx);
+                if (idx >= 0) {
+                    const s = segments[idx];
+                    const pct = ((s.count / total) * 100).toFixed(1);
+                    tooltip.innerHTML = '<strong style="color:' + s.color + '">' + s.label + '</strong><br>' + s.count + ' findings<br><span style="color:#9ca3af">' + pct + '% of total</span>';
+                    tooltip.style.display = 'block';
+                    tooltip.style.left  = (e.clientX + 16) + 'px';
+                    tooltip.style.top   = (e.clientY - 12) + 'px';
+                } else { tooltip.style.display = 'none'; }
+            });
+            canvas.addEventListener('mouseleave', function() {
+                draw(-1); tooltip.style.display = 'none';
+            });
+        }
+
+        // ── IOC Mini Donut Charts ──────────────────────────
+        function initAllMiniDonuts() {
+            const tip = document.getElementById('donut-tooltip');
+            document.querySelectorAll('canvas.ioc-mini-donut').forEach(function(canvas) {
+                const ctx = canvas.getContext('2d');
+                if (!ctx) return;
+                const skipped = canvas.dataset.skipped === 'true';
+                const c = parseInt(canvas.dataset.critical) || 0;
+                const h = parseInt(canvas.dataset.high)     || 0;
+                const m = parseInt(canvas.dataset.medium)   || 0;
+                const l = parseInt(canvas.dataset.low)      || 0;
+                const total = c + h + m + l;
+                const cx2 = canvas.width / 2, cy2 = canvas.height / 2;
+                const outerR2 = 42, innerR2 = 27, gap2 = 0.07;
+                const segs = [
+                    { label: 'Critical', count: c, color: '#C41E3A' },
+                    { label: 'High',     count: h, color: '#FF1493' },
+                    { label: 'Medium',   count: m, color: '#f97316' },
+                    { label: 'Low',      count: l, color: '#4ade80' },
+                ];
+                function drawMini() {
+                    ctx.clearRect(0, 0, canvas.width, canvas.height);
+                    if (skipped || total === 0) {
+                        ctx.beginPath();
+                        ctx.arc(cx2, cy2, outerR2, 0, 2 * Math.PI);
+                        ctx.arc(cx2, cy2, innerR2, 0, 2 * Math.PI, true);
+                        ctx.fillStyle = skipped ? '#4338ca33' : '#374151';
+                        ctx.fill();
+                        if (skipped) {
+                            ctx.beginPath();
+                            ctx.arc(cx2, cy2, outerR2 - 1, 0, 2 * Math.PI);
+                            ctx.strokeStyle = '#6366f1'; ctx.lineWidth = 2; ctx.stroke();
+                        }
+                        return;
+                    }
+                    let start2 = -Math.PI / 2;
+                    for (let i = 0; i < segs.length; i++) {
+                        const s = segs[i];
+                        if (s.count === 0) continue;
+                        const sweep = (s.count / total) * 2 * Math.PI - gap2;
+                        const sa = start2 + gap2 / 2, ea = sa + sweep;
+                        ctx.beginPath();
+                        ctx.moveTo(cx2 + innerR2 * Math.cos(sa), cy2 + innerR2 * Math.sin(sa));
+                        ctx.arc(cx2, cy2, outerR2, sa, ea);
+                        ctx.arc(cx2, cy2, innerR2, ea, sa, true);
+                        ctx.closePath();
+                        ctx.fillStyle = s.color + 'dd';
+                        ctx.fill();
+                        start2 += sweep + gap2;
+                    }
+                }
+                drawMini();
+                canvas.addEventListener('mouseenter', function(e) {
+                    const src = canvas.dataset.source || '';
+                    let html = '<strong style="color:#e8eaed">' + src + '</strong><br>';
+                    if (skipped) {
+                        html += '<em style="color:#818cf8">&#x23ED; Skipped in quick mode</em>';
+                    } else if (total === 0) {
+                        html += '<span style="color:#4ade80">&#x2705; Clean</span>';
+                    } else {
+                        segs.filter(function(s){ return s.count > 0; }).forEach(function(s) {
+                            html += '<span style="color:' + s.color + '">&#x25CF; ' + s.label + ':</span> ' + s.count + '<br>';
+                        });
+                    }
+                    tip.innerHTML = html;
+                    tip.style.display = 'block';
+                    tip.style.left = (e.clientX + 16) + 'px';
+                    tip.style.top  = (e.clientY - 12) + 'px';
+                });
+                canvas.addEventListener('mousemove', function(e) {
+                    tip.style.left = (e.clientX + 16) + 'px';
+                    tip.style.top  = (e.clientY - 12) + 'px';
+                });
+                canvas.addEventListener('mouseleave', function() { tip.style.display = 'none'; });
+            });
+        }
+
+        // Auto-expand first tool with findings
+        window.addEventListener('DOMContentLoaded', () => {
+            // Draw severity donut chart
+            initSeverityDonut();
+            initAllMiniDonuts();
+
+            // Update source counts based on actual data-source attributes
+            updateSourceCounts();
+            
+            const badges = Array.from(document.querySelectorAll('.tool-stat-badge'));
+            const firstIssue = badges.find(badge => badge.textContent.includes('❗') || badge.textContent.includes('⚠️'));
+            
+            if (firstIssue) {
+                const toolCard = firstIssue.closest('.tool-card');
+                const toolHeader = toolCard.querySelector('.tool-header');
+                toolHeader.click();
+            }
+            
+            // Initial sort by severity
+            sortFindings('severity');
+        });
+    </script>
+EOF
+
+# Inject classification bottom banner
+if [ "${CLASS_SHOW_BANNER}" = "true" ]; then
+    cat >> "$OUTPUT_HTML" << EOF
+    <div class="classification-banner-bottom" style="background:${CLASS_BG};color:${CLASS_TEXT_COLOR};">
+        ${CLASS_LABEL}
+    </div>
+EOF
+fi
+
+cat >> "$OUTPUT_HTML" << 'EOF'
+</body>
+</html>
+EOF
+
+# Symlink the dashboard to the scan root for easy access
+ln -sf "consolidated-reports/dashboards/security-dashboard.html" "${LATEST_SCAN}/security-dashboard.html" 2>/dev/null || \
+    cp "$OUTPUT_HTML" "${LATEST_SCAN}/security-dashboard.html" 2>/dev/null || true
+
+echo ""
+echo "✅ Interactive dashboard generated: $OUTPUT_HTML"
+echo "📋 Root shortcut:                  ${LATEST_SCAN}/security-dashboard.html"
+echo ""
+echo "Summary:"
+echo "  Critical: $TOTAL_CRITICAL"
+echo "  High:     $TOTAL_HIGH"
+echo "  Medium:   $TOTAL_MEDIUM"
+echo "  Low:      $TOTAL_LOW"
+echo "  Total:    $TOTAL_FINDINGS"
+echo ""
+echo "Open the dashboard:"
+echo "  open ${LATEST_SCAN}/security-dashboard.html"

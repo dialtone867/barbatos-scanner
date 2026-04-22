@@ -1,0 +1,6 @@
+scans/
+*.sarif
+*.sarif.json
+/tmp/
+.env
+.env.local

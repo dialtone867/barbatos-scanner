@@ -1,0 +1,348 @@
+#!/usr/bin/env bash
+
+# Helm Chart Build Script
+# Builds and validates Helm charts
+# Updated to use absolute paths and handle directory names with spaces
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+PURPLE='\033[0;35m'
+CYAN='\033[0;36m'
+WHITE='\033[1;37m'
+NC='\033[0m' # No Color
+
+# Help function
+show_help() {
+    echo -e "${WHITE}Helm Chart Builder & Validator${NC}"
+    echo ""
+    echo "Usage: $0 [OPTIONS]"
+    echo ""
+    echo "Builds and validates Helm charts for Kubernetes deployment."
+    echo "Includes dependency resolution, linting, and template rendering."
+    echo ""
+    echo "Options:"
+    echo "  -h, --help          Show this help message and exit"
+    echo ""
+    echo "Environment Variables:"
+    echo "  TARGET_DIR          Directory containing Helm chart (default: current directory)"
+    echo "  SCAN_ID             Override auto-generated scan ID"
+    echo "  SCAN_DIR            Override output directory for build results"
+    echo "  AWS_REGION          AWS region for ECR (default: us-gov-west-1)"
+    echo ""
+    echo "Output:"
+    echo "  Results are saved to: scans/{SCAN_ID}/helm/"
+    echo "  - helm-build-results.json       Build and validation results"
+    echo "  - helm-template-output.yaml     Rendered templates"
+    echo "  - helm-lint.log                 Linting output"
+    echo ""
+    echo "Build Steps:"
+    echo "  1. AWS ECR authentication (optional)"
+    echo "  2. Dependency resolution (helm dependency update)"
+    echo "  3. Chart linting (helm lint)"
+    echo "  4. Template rendering (helm template)"
+    echo "  5. Validation summary"
+    echo ""
+    echo "Examples:"
+    echo "  $0                              # Build chart in current directory"
+    echo "  TARGET_DIR=/path/to/chart $0    # Build specific chart"
+    echo ""
+    echo "Notes:"
+    echo "  - Requires Helm 3.x to be installed"
+    echo "  - AWS ECR login optional for private dependencies"
+    echo "  - Creates stub dependencies if authentication skipped"
+    exit 0
+}
+
+# Parse arguments
+for arg in "$@"; do
+    case $arg in
+        -h|--help)
+            show_help
+            ;;
+    esac
+done
+
+# Initialize scan environment using scan directory approach
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./common.sh
+source "$SCRIPT_DIR/common.sh"
+
+# Source the scan directory template
+source "$SCRIPT_DIR/scan-directory-template.sh"
+
+# Initialize scan environment for Helm
+init_scan_environment "helm"
+
+# Set TARGET_SCAN_DIR and extract scan information
+TARGET_SCAN_DIR="${TARGET_DIR:-$(pwd)}"
+TARGET_SCAN_DIR=$(realpath "${TARGET_SCAN_DIR}" 2>/dev/null) || { echo "ERROR: Target path does not exist or is invalid: ${TARGET_SCAN_DIR}" >&2; exit 1; }
+REPO_PATH="${TARGET_SCAN_DIR}"
+if [[ -n "$SCAN_ID" ]]; then
+    TARGET_NAME=$(echo "$SCAN_ID" | cut -d'_' -f1)
+    USERNAME=$(echo "$SCAN_ID" | cut -d'_' -f2)
+    TIMESTAMP=$(echo "$SCAN_ID" | cut -d'_' -f3-)
+else
+    # Fallback for standalone execution
+    TARGET_NAME=$(basename "$TARGET_SCAN_DIR")
+    USERNAME=$(whoami)
+    TIMESTAMP=$(date '+%Y-%m-%d_%H-%M-%S')
+    SCAN_ID="${TARGET_NAME}_${USERNAME}_${TIMESTAMP}"
+fi
+
+echo
+echo -e "${WHITE}============================================${NC}"
+echo -e "${WHITE}Helm Chart Builder & Validator${NC}"
+echo -e "${WHITE}============================================${NC}"
+echo
+
+# AWS ECR Authentication for private dependencies
+echo -e "${BLUE}🔐 Step 0: AWS ECR Authentication (Optional)${NC}"
+echo "=================================="
+AWS_REGION="us-gov-west-1"
+ECR_REGISTRY="231388672283.dkr.ecr.us-gov-west-1.amazonaws.com"
+
+# Offer AWS ECR authentication for private Helm dependencies
+# Check if running interactively
+AWS_AUTHENTICATED=false
+aws_choice="${HELM_AWS_AUTH:-2}"
+
+if [ -t 0 ]; then
+    # Interactive mode - prompt user
+    echo -e "${CYAN}🔐 This chart may require AWS ECR authentication for private dependencies${NC}"
+    echo "Options:"
+    echo "  1) Attempt AWS ECR login (recommended for complete build)"
+    echo "  2) Skip authentication (fallback to stub dependencies)"
+    echo
+    echo "(will auto-select option 2 in 30 seconds if no input)"
+    read -t 30 -p "Choose option (1 or 2, default: 2): " aws_choice || true
+    aws_choice="${aws_choice:-2}"
+else
+    # Non-interactive mode - skip AWS auth by default
+    echo -e "${CYAN}🔐 Non-interactive mode: Skipping AWS ECR authentication${NC}"
+    echo "   Set HELM_AWS_AUTH=1 to enable AWS authentication"
+fi
+
+if [[ "${aws_choice}" == "1" ]]; then
+    echo -e "${CYAN}🚀 Running AWS ECR authentication...${NC}"
+    
+    # Check if AWS CLI is available
+    if command -v aws &> /dev/null; then
+        echo "Checking AWS credentials..."
+        if aws sts get-caller-identity &> /dev/null; then
+            echo -e "${GREEN}✅ AWS credentials found${NC}"
+            
+            # Attempt ECR login
+            echo "Attempting ECR authentication..."
+            if aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY" &> /dev/null; then
+                echo -e "${GREEN}✅ AWS ECR authentication successful${NC}"
+                AWS_AUTHENTICATED=true
+            else
+                echo -e "${YELLOW}⚠️  ECR authentication failed - continuing with fallback${NC}"
+            fi
+        else
+            echo -e "${YELLOW}⚠️  AWS credentials not configured${NC}"
+            echo "To set up AWS credentials:"
+            echo "  ${GREEN}aws configure${NC} (for access keys)"
+            echo "  ${GREEN}aws configure sso${NC} (for SSO)"
+            echo "  ${GREEN}aws sso login --profile <profile>${NC} (to login)"
+        fi
+    else
+        echo -e "${RED}❌ AWS CLI not found${NC}"
+        echo "Install AWS CLI: https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html"
+    fi
+else
+    echo -e "${CYAN}⏭️  Skipping AWS authentication${NC}"
+fi
+
+echo
+
+# Function to build and validate Helm chart
+build_helm_chart() {
+    local chart_path="$1"
+    local chart_name="$2"
+    
+    if [ -d "$chart_path" ]; then
+        echo -e "${BLUE}🏗️  Building Helm chart: $chart_name${NC}"
+        
+        # Lint the chart
+        echo "Linting chart: $chart_name"
+        helm lint "$chart_path" 2>&1 | tee -a "$SCAN_LOG"
+        
+        # Template the chart
+        echo "Templating chart: $chart_name"
+        helm template "$chart_name" "$chart_path" \
+            --output-dir "$OUTPUT_DIR" 2>&1 | tee -a "$SCAN_LOG"
+            
+        # Package the chart
+        echo "Packaging chart: $chart_name"
+        helm package "$chart_path" \
+            --destination "$OUTPUT_DIR" 2>&1 | tee -a "$SCAN_LOG"
+            
+        if [ $? -eq 0 ]; then
+            echo -e "${GREEN}✅ Helm chart built successfully: $chart_name${NC}"
+        else
+            echo -e "${RED}❌ Helm chart build failed: $chart_name${NC}"
+        fi
+        echo
+    fi
+}
+
+# 1. Helm Chart Building
+echo -e "${CYAN}🏗️  Step 1: Helm Chart Discovery & Building${NC}"
+echo "==========================================="
+
+# Use TARGET_DIR if set, otherwise use $1 or current directory
+SEARCH_DIR="${TARGET_DIR:-${1:-$(pwd)}}"
+echo -e "${BLUE}📁 Searching for Helm charts in: $SEARCH_DIR${NC}"
+
+# Track charts found
+CHARTS_FOUND=0
+
+# Search for Helm charts in the target directory
+if [ -d "$SEARCH_DIR" ]; then
+    # Look for Chart.yaml files
+    CHART_FILES=$(find "$SEARCH_DIR" -name "Chart.yaml" -type f 2>/dev/null)
+    
+    if [ -n "$CHART_FILES" ]; then
+        # Use process substitution to avoid subshell variable scope issue
+        while IFS= read -r chart_file; do
+            chart_dir=$(dirname "$chart_file")
+            chart_name=$(basename "$chart_dir")
+            echo -e "${GREEN}📦 Found Helm chart: $chart_name at $chart_dir${NC}"
+            build_helm_chart "$chart_dir" "$chart_name"
+            CHARTS_FOUND=$((CHARTS_FOUND + 1))
+        done <<< "$CHART_FILES"
+    fi
+fi
+
+# Also check for common chart locations relative to SEARCH_DIR
+COMMON_CHART_PATHS=(
+    "helm"
+    "charts"
+    "chart"
+    "chart-env"
+    "k8s"
+    "kubernetes"
+    "deploy"
+    "deployment"
+    "manifests"
+)
+
+for chart_path in "${COMMON_CHART_PATHS[@]}"; do
+    full_path="$SEARCH_DIR/$chart_path"
+    if [ -f "$full_path/Chart.yaml" ]; then
+        echo -e "${GREEN}📦 Found Helm chart in common path: $chart_path${NC}"
+        build_helm_chart "$full_path" "$chart_path"
+        CHARTS_FOUND=$((CHARTS_FOUND + 1))
+    fi
+done
+
+if [ "$CHARTS_FOUND" -eq 0 ]; then
+    echo -e "${YELLOW}⚠️  No Helm charts found in $SEARCH_DIR${NC}"
+fi
+
+echo
+echo -e "${CYAN}📊 Helm Chart Build Summary${NC}"
+echo "==================================="
+
+CHART_COUNT=$(find "$OUTPUT_DIR" -name "*.tgz" 2>/dev/null | wc -l | tr -d ' ')
+TEMPLATE_COUNT=$(find "$OUTPUT_DIR" -name "*.yaml" -type f 2>/dev/null | wc -l | tr -d ' ')
+LINT_ERRORS=0
+LINT_WARNINGS=0
+
+# Parse lint results if log exists
+if [ -f "$SCAN_LOG" ]; then
+    LINT_ERRORS=$(grep -c "Error:" "$SCAN_LOG" 2>/dev/null || echo "0")
+    LINT_WARNINGS=$(grep -c "Warning:" "$SCAN_LOG" 2>/dev/null || echo "0")
+fi
+
+# Generate JSON results for dashboard
+HELM_RESULTS_JSON="$OUTPUT_DIR/helm-results.json"
+cat > "$HELM_RESULTS_JSON" << EOF
+{
+  "scan_id": "$SCAN_ID",
+  "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "target_dir": "$SEARCH_DIR",
+  "summary": {
+    "charts_found": $CHARTS_FOUND,
+    "charts_built": $CHART_COUNT,
+    "templates_generated": $TEMPLATE_COUNT,
+    "lint_errors": $LINT_ERRORS,
+    "lint_warnings": $LINT_WARNINGS
+  },
+  "charts": [
+EOF
+
+# Add chart details
+first=true
+find "$OUTPUT_DIR" -name "*.tgz" 2>/dev/null | while read chart; do
+    chart_name=$(basename "$chart" .tgz)
+    if [ "$first" = true ]; then
+        first=false
+    else
+        echo "," >> "$HELM_RESULTS_JSON"
+    fi
+    echo "    {\"name\": \"$chart_name\", \"file\": \"$(basename "$chart")\"}" >> "$HELM_RESULTS_JSON"
+done
+
+cat >> "$HELM_RESULTS_JSON" << EOF
+  ],
+  "status": "$([ $LINT_ERRORS -eq 0 ] && echo "success" || echo "errors")"
+}
+EOF
+
+echo -e "🏗️  Helm Chart Build Summary:"
+if [ $CHART_COUNT -gt 0 ]; then
+    echo -e "${GREEN}✅ $CHART_COUNT Helm chart(s) built successfully${NC}"
+    
+    echo "  📦 Built Charts:"
+    find "$OUTPUT_DIR" -name "*.tgz" 2>/dev/null | while read chart; do
+        echo "    📄 $(basename "$chart")"
+    done
+else
+    echo -e "${YELLOW}⚠️  No Helm charts were built${NC}"
+fi
+
+echo
+echo -e "${BLUE}📁 Output Files:${NC}"
+echo "==============="
+find "$OUTPUT_DIR" -type f 2>/dev/null | while read file; do
+    echo "📄 $(basename "$file")"
+done
+echo "📝 Build log: $SCAN_LOG"
+echo "📂 Reports directory: $OUTPUT_DIR"
+
+echo
+echo -e "${BLUE}🔧 Available Commands:${NC}"
+echo "===================="
+echo "📊 Analyze charts:         helm lint ./charts/*"
+echo "🔍 Template charts:        helm template <name> <chart>"
+echo "🏗️  Build charts:           helm package <chart>"
+echo "📦 Install charts:         helm install <name> <chart>"
+echo "🌐 Deploy charts:          helm upgrade --install <name> <chart>"
+echo "☸️  Kubernetes deploy:      kubectl apply -f $OUTPUT_DIR"
+echo "🛡️  Security scan:          helm lint --strict <chart>"
+echo "📋 View templates:         find $OUTPUT_DIR -name '*.yaml' | head -10"
+
+echo
+echo -e "${BLUE}🔗 Additional Resources:${NC}"
+echo "======================="
+echo "• Helm Documentation: https://helm.sh/docs/"
+echo "• Chart Best Practices: https://helm.sh/docs/chart_best_practices/"
+echo "• Kubernetes Security: https://kubernetes.io/docs/concepts/security/"
+echo "• Helm Security Guide: https://helm.sh/docs/topics/security/"
+
+echo
+# Create current symlink for easy access
+ln -sf "$(basename "$SCAN_LOG")" "$CURRENT_LOG"
+
+echo "============================================"
+echo -e "${GREEN}✅ Helm chart building completed successfully!${NC}"
+echo "============================================"
+echo
+echo "============================================"
+echo "Helm chart building complete."
+echo "============================================"

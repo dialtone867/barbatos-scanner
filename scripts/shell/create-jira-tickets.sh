@@ -1,0 +1,545 @@
+#!/usr/bin/env bash
+# create-jira-tickets.sh — Create or update JIRA tickets for BARBATOS security findings.
+#
+# All inputs are passed via environment variables (set by the calling workflow step):
+#
+#   FINDINGS_FILE          — path to security-findings-summary.json
+#   JIRA_URL               — Jira Cloud base URL (e.g. https://org.atlassian.net)
+#   PROJECT_KEY            — Jira project key (e.g. SEC)
+#   ISSUE_TYPE             — Jira issue type (default: Bug)
+#   AUTH                   — base64-encoded "email:token" string
+#   REPO_NAME              — GitHub repository (owner/repo)
+#   REPO_SLUG              — URL-safe version of REPO_NAME
+#   TODAY                  — current UTC date (YYYY-MM-DD)
+#   RUN_URL                — URL of the GitHub Actions run
+#   CRITICAL_COUNT         — integer count of critical findings
+#   HIGH_COUNT             — integer count of high findings
+#   MEDIUM_COUNT           — integer count of medium findings
+#   LOW_COUNT              — integer count of low findings
+#   GITHUB_ISSUE_URL       — URL of the associated GitHub issue (optional)
+#   GITHUB_ISSUE_NUMBER    — number of the associated GitHub issue (optional)
+#   GITHUB_TOKEN           — GitHub token for reading/updating the issue body (dedup)
+#   GITHUB_STEP_SUMMARY    — path to the GitHub step summary file
+
+set -euo pipefail
+
+# ── Helper: fetch current GitHub issue body via API ──────────────────────────
+get_github_issue_body() {
+  [[ -z "${GITHUB_ISSUE_NUMBER:-}" ]] && echo "" && return
+  [[ -z "${GITHUB_TOKEN:-}" ]]        && echo "" && return
+  curl -s \
+    -H "Authorization: token ${GITHUB_TOKEN}" \
+    -H "Accept: application/vnd.github.v3+json" \
+    "https://api.github.com/repos/${REPO_NAME}/issues/${GITHUB_ISSUE_NUMBER}" \
+    | jq -r '.body // ""'
+}
+
+# ── Helper: find existing open Jira ticket via key stored in GitHub issue body ─
+# Avoids Jira search entirely. After creating a ticket we embed
+# <!--barbatos-jira-{label}:KEY--> in the GitHub issue body. On subsequent runs we
+# extract that key and call GET /rest/api/3/issue/{key} to check if still open.
+# All status messages go to stderr; only the key (or empty string) goes to stdout.
+find_existing_jira_ticket() {
+  local label_severity="$1"
+  [[ -z "${GITHUB_ISSUE_NUMBER:-}" ]] && echo "" && return
+  [[ -z "${GITHUB_TOKEN:-}" ]]        && echo "" && return
+
+  local issue_body
+  issue_body=$(get_github_issue_body)
+  [[ -z "${issue_body}" ]] && echo "" && return
+
+  echo "${issue_body}" > /tmp/barbatos_issue_body.txt
+  local stored_key
+  stored_key=$(python3 - "${label_severity}" /tmp/barbatos_issue_body.txt <<'PYEOF'
+import sys, re
+label, body_file = sys.argv[1], sys.argv[2]
+with open(body_file) as f:
+    body = f.read()
+m = re.search(r'<!--barbatos-jira-' + re.escape(label) + r':([A-Z]+-\d+)-->', body)
+print(m.group(1) if m else '')
+PYEOF
+  )
+
+  if [[ -z "${stored_key}" ]]; then
+    echo "    No stored Jira key for ${label_severity} — will create new ticket" >&2
+    echo ""
+    return
+  fi
+
+  echo "    Stored key '${stored_key}' found — verifying it is still open..." >&2
+  local ticket_http
+  ticket_http=$(curl -s -o /tmp/jira_ticket.json -w "%{http_code}" \
+    -H "Authorization: Basic ${AUTH}" \
+    -H "Accept: application/json" \
+    "${JIRA_URL}/rest/api/3/issue/${stored_key}?fields=status,summary")
+
+  if [[ "${ticket_http}" == "200" ]]; then
+    local status_cat
+    status_cat=$(jq -r '.fields.status.statusCategory.key // "open"' /tmp/jira_ticket.json 2>/dev/null || echo "open")
+    if [[ "${status_cat}" != "done" ]]; then
+      echo "${stored_key}"
+    else
+      echo "    Ticket ${stored_key} is closed — will create new" >&2
+      echo ""
+    fi
+  else
+    echo "    Ticket ${stored_key} lookup returned HTTP ${ticket_http} — will create new" >&2
+    echo ""
+  fi
+}
+
+# ── Helper: embed Jira ticket key in GitHub issue body for future runs ─────────
+store_jira_key_in_github() {
+  local label_severity="$1"
+  local jira_key="$2"
+  [[ -z "${GITHUB_ISSUE_NUMBER:-}" ]] && return 0
+  [[ -z "${GITHUB_TOKEN:-}" ]]        && return 0
+
+  local current_body
+  current_body=$(get_github_issue_body)
+  echo "${current_body}" > /tmp/barbatos_issue_body.txt
+
+  local new_body
+  new_body=$(python3 - "${label_severity}" "${jira_key}" /tmp/barbatos_issue_body.txt <<'PYEOF'
+import sys, re
+label, key, body_file = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(body_file) as f:
+    body = f.read()
+marker  = f'<!--barbatos-jira-{label}:{key}-->'
+pattern = r'<!--barbatos-jira-' + re.escape(label) + r':[A-Z]+-\d+-->'
+if re.search(pattern, body):
+    new_body = re.sub(pattern, marker, body)
+else:
+    new_body = body.rstrip('\n') + '\n' + marker
+print(new_body, end='')
+PYEOF
+  )
+
+  local update_payload
+  update_payload=$(jq -n --arg body "${new_body}" '{body: $body}')
+  local update_http
+  update_http=$(curl -s -o /dev/null -w "%{http_code}" \
+    -X PATCH \
+    -H "Authorization: token ${GITHUB_TOKEN}" \
+    -H "Accept: application/vnd.github.v3+json" \
+    -H "Content-Type: application/json" \
+    --data "${update_payload}" \
+    "https://api.github.com/repos/${REPO_NAME}/issues/${GITHUB_ISSUE_NUMBER}")
+  if [[ "${update_http}" == "200" ]]; then
+    echo "📎 Stored Jira key ${jira_key} in GitHub issue #${GITHUB_ISSUE_NUMBER}"
+  else
+    echo "⚠️  Could not store Jira key in GitHub issue (HTTP ${update_http}) — continuing"
+  fi
+}
+
+# ── Helper: build ADF body from a severity section of findings JSON ───────────
+# Args: severity_key summary_line [filter_ids_json] [all_current_ids_json]
+build_adf_body() {
+  local severity_key="$1"
+  local summary_line="$2"
+  local filter_ids_json="${3:-}"
+  local all_current_ids_json="${4:-[]}"
+  python3 - "${FINDINGS_FILE}" "${severity_key}" "${summary_line}" "${RUN_URL}" "${REPO_NAME}" "${filter_ids_json}" "${all_current_ids_json}" <<'PYEOF'
+import json, sys
+
+findings_file, severity_key, summary_line, run_url, repo_name = sys.argv[1:6]
+filter_ids_raw  = sys.argv[6] if len(sys.argv) > 6 else ''
+all_current_raw = sys.argv[7] if len(sys.argv) > 7 else '[]'
+
+filter_ids      = set(json.loads(filter_ids_raw)) if filter_ids_raw and filter_ids_raw not in ('', '[]') else None
+all_tracked_ids = json.loads(all_current_raw) if all_current_raw else []
+
+with open(findings_file) as f:
+    data = json.load(f)
+
+findings = data.get(severity_key, [])
+
+if filter_ids:
+    findings = [f for f in findings if (
+        f.get("vulnerability_id") or f.get("check_id")
+        or f.get("detector") or "unknown"
+    ) in filter_ids]
+
+rows = []
+kev_findings = []
+for finding in findings:
+    vuln_id = (finding.get("vulnerability_id") or finding.get("check_id")
+               or finding.get("detector") or "N/A")
+    pkg     = (finding.get("package_name") or finding.get("file_path")
+               or finding.get("file") or "N/A")
+    version = finding.get("package_version") or "-"
+    tool    = finding.get("tool") or "N/A"
+    desc    = (finding.get("description") or "")[:120]
+    nvd_url = finding.get("nvd_url") or ""
+    is_kev  = finding.get("cisa_kev") is True
+    rows.append({"id": vuln_id, "pkg": pkg, "ver": version, "tool": tool,
+                 "desc": desc, "nvd_url": nvd_url, "is_kev": is_kev})
+    if is_kev:
+        kev_findings.append({
+            "id": vuln_id,
+            "due_date": finding.get("cisa_due_date") or "N/A",
+            "required_action": (finding.get("cisa_required_action") or "")[:200],
+            "ransomware": finding.get("cisa_known_ransomware") is True,
+        })
+
+def cell_text(text):
+    return {"type": "tableCell", "attrs": {},
+            "content": [{"type": "paragraph", "content": [
+                {"type": "text", "text": str(text)[:200]}]}]}
+
+def cell_link(text, url):
+    if url:
+        return {"type": "tableCell", "attrs": {},
+                "content": [{"type": "paragraph", "content": [
+                    {"type": "text", "text": str(text)[:200],
+                     "marks": [{"type": "link", "attrs": {"href": url}}]}]}]}
+    return cell_text(text)
+
+def header_cell(text):
+    return {"type": "tableHeader", "attrs": {},
+            "content": [{"type": "paragraph", "content": [
+                {"type": "text", "text": str(text), "marks": [{"type": "strong"}]}]}]}
+
+header_row = {"type": "tableRow",
+              "content": [header_cell(h) for h in
+                          ["ID / CVE", "Package / File", "Version", "Tool", "Description"]]}
+
+data_rows = []
+for r in rows:
+    kev_prefix = "\U0001f525 " if r["is_kev"] else ""
+    id_cell = cell_link(kev_prefix + r["id"], r["nvd_url"]) if r["nvd_url"] else cell_text(kev_prefix + r["id"])
+    data_rows.append({"type": "tableRow",
+                      "content": [id_cell, cell_text(r["pkg"]), cell_text(r["ver"]),
+                                  cell_text(r["tool"]), cell_text(r["desc"])]})
+
+table = {"type": "table",
+         "attrs": {"isNumberColumnEnabled": False, "layout": "full-width"},
+         "content": [header_row] + data_rows}
+
+kev_panel_blocks = []
+if kev_findings:
+    kev_lines = []
+    for k in kev_findings:
+        line_text = f"\U0001f525 {k['id']} \u2014 Due: {k['due_date']}"
+        if k["ransomware"]:
+            line_text += " \u26a0\ufe0f Ransomware"
+        if k["required_action"]:
+            line_text += f"\n   Action: {k['required_action']}"
+        kev_lines.append({"type": "paragraph", "content": [{"type": "text", "text": line_text}]})
+    kev_panel_blocks = [{"type": "panel", "attrs": {"panelType": "error"},
+                         "content": [
+                             {"type": "paragraph", "content": [
+                                 {"type": "text",
+                                  "text": f"\U0001f525 {len(kev_findings)} CISA Known Exploited Vulnerabilities Detected",
+                                  "marks": [{"type": "strong"}]}]},
+                             *kev_lines,
+                             {"type": "paragraph", "content": [
+                                 {"type": "text", "text": "CISA KEV Catalog",
+                                  "marks": [{"type": "link", "attrs": {
+                                      "href": "https://www.cisa.gov/known-exploited-vulnerabilities-catalog"}}]}]}
+                         ]}]
+
+ac_heading = {"type": "heading", "attrs": {"level": 3},
+              "content": [{"type": "text", "text": "Acceptance Criteria"}]}
+ac_list = {"type": "bulletList", "content": [
+    {"type": "listItem", "content": [{"type": "paragraph", "content": [{"type": "text",
+        "text": "All listed vulnerabilities have been remediated, formally accepted with documented risk, or are tracked in an approved exception workflow"}]}]},
+    {"type": "listItem", "content": [{"type": "paragraph", "content": [{"type": "text",
+        "text": f"A follow-up BARBATOS scan of {repo_name} returns zero unresolved findings at this severity tier"}]}]},
+    {"type": "listItem", "content": [{"type": "paragraph", "content": [{"type": "text",
+        "text": "Any CISA KEV items are addressed on or before their published due dates"}]}]},
+]}
+dod_heading = {"type": "heading", "attrs": {"level": 3},
+               "content": [{"type": "text", "text": "Definition of Done"}]}
+dod_list = {"type": "bulletList", "content": [
+    {"type": "listItem", "content": [{"type": "paragraph", "content": [{"type": "text",
+        "text": "Remediation changes reviewed, approved, and merged to the default branch"}]}]},
+    {"type": "listItem", "content": [{"type": "paragraph", "content": [{"type": "text",
+        "text": "Re-scan completed with this severity tier showing no remaining unresolved findings"}]}]},
+    {"type": "listItem", "content": [{"type": "paragraph", "content": [{"type": "text",
+        "text": "If risk accepted: exception documented with approver name, justification, and scheduled review date"}]}]},
+    {"type": "listItem", "content": [{"type": "paragraph", "content": [{"type": "text",
+        "text": "Ticket resolved only after re-scan confirmation"}]}]},
+]}
+
+adf = {"version": 1, "type": "doc",
+       "content": [
+           *kev_panel_blocks,
+           {"type": "paragraph", "content": [{"type": "text", "text": summary_line}]},
+           table,
+           ac_heading,
+           ac_list,
+           dod_heading,
+           dod_list,
+           {"type": "paragraph", "content": [
+               {"type": "text", "text": "Repository: "},
+               {"type": "text", "text": repo_name, "marks": [{"type": "code"}]}]},
+           {"type": "paragraph", "content": [
+               {"type": "text", "text": "Workflow run: "},
+               {"type": "text", "text": run_url,
+                "marks": [{"type": "link", "attrs": {"href": run_url}}]}]},
+           {"type": "paragraph", "content": [
+               {"type": "text", "text": "\U0001f916 Automated ticket created by BARBATOS Security Scanner"}]}
+       ]}
+
+if all_tracked_ids:
+    adf["content"].append({
+        "type": "codeBlock", "attrs": {"language": "text"},
+        "content": [{"type": "text",
+                     "text": "[barbatos-tracked-vuln-ids:" + json.dumps(all_tracked_ids) + "]"}]
+    })
+
+print(json.dumps(adf))
+PYEOF
+}
+
+# ── Helper: add a Jira Remote Link pointing back to the GitHub issue ──────────
+link_jira_to_github() {
+  local jira_key="$1"
+  [[ -z "${GITHUB_ISSUE_URL:-}" ]] && return 0
+  local link_payload
+  link_payload=$(jq -n \
+    --arg global_id "github-issue-${GITHUB_ISSUE_NUMBER:-0}" \
+    --arg gh_url    "${GITHUB_ISSUE_URL}" \
+    --arg gh_title  "GitHub Issue #${GITHUB_ISSUE_NUMBER:-}" \
+    '{globalId: $global_id, relationship: "GitHub Issue",
+      object: {url: $gh_url, title: $gh_title,
+               icon: {url16x16: "https://github.com/favicon.ico", title: "GitHub"}}}')
+  local link_http
+  link_http=$(curl -s -o /dev/null -w "%{http_code}" \
+    -X POST \
+    -H "Authorization: Basic ${AUTH}" \
+    -H "Content-Type: application/json" \
+    -H "Accept: application/json" \
+    --data "${link_payload}" \
+    "${JIRA_URL}/rest/api/3/issue/${jira_key}/remotelink")
+  if [[ "${link_http}" == "201" ]]; then
+    echo "✅ Linked ${jira_key} → GitHub issue #${GITHUB_ISSUE_NUMBER}"
+  else
+    echo "⚠️  Remote link on ${jira_key} returned HTTP ${link_http} — continuing"
+  fi
+}
+
+# ── Helper: create or update one JIRA ticket for a severity level ─────────────
+create_jira_ticket() {
+  local title="$1"
+  local label_severity="$2"  # barbatos-critical / barbatos-high / barbatos-medium / barbatos-low
+  local priority="$3"        # Highest / High / Medium / Low
+  local severity_key="$4"    # critical_findings / high_findings / etc.
+  local summary_line="$5"
+
+  # Collect current vuln IDs for the tracking marker embedded in new tickets.
+  local current_ids_json='[]'
+  if [[ -f "${FINDINGS_FILE}" ]]; then
+    current_ids_json=$(python3 - "${severity_key}" "${FINDINGS_FILE}" <<'JIRA_GETIDS'
+import json, sys
+skey, fpath = sys.argv[1], sys.argv[2]
+with open(fpath) as f:
+    data = json.load(f)
+ids = []
+for x in data.get(skey, []):
+    vid = (x.get('vulnerability_id') or x.get('check_id') or x.get('detector') or 'unknown')
+    if vid not in ids:
+        ids.append(vid)
+print(json.dumps(ids))
+JIRA_GETIDS
+    ) 2>/dev/null || current_ids_json='[]'
+  fi
+
+  echo "--- Checking for existing open ticket: ${label_severity} ---"
+  local existing_key
+  existing_key=$(find_existing_jira_ticket "${label_severity}")
+
+  if [[ -n "${existing_key}" ]]; then
+      echo "🔄  Found open ticket ${existing_key} — adding update comment"
+      echo "## 🔄 JIRA: Update comment added to ${existing_key}" >> "${GITHUB_STEP_SUMMARY}"
+      echo "- Severity group: **${label_severity}**" >> "${GITHUB_STEP_SUMMARY}"
+      echo "- Ticket: [${existing_key}](${JIRA_URL}/browse/${existing_key})" >> "${GITHUB_STEP_SUMMARY}"
+
+      local update_summary="BARBATOS scan on $(date -u +%Y-%m-%d): ${summary_line} (run: ${RUN_URL})"
+      local comment_adf
+      comment_adf=$(build_adf_body "${severity_key}" "${update_summary}" "" "${current_ids_json}")
+      jq -n --argjson body "${comment_adf}" '{body: $body}' > /tmp/jira_comment_body.json 2>/dev/null || true
+      local comment_http
+      comment_http=$(curl -s -o /tmp/jira_comment_resp.json -w "%{http_code}" \
+        -X POST \
+        -H "Authorization: Basic ${AUTH}" \
+        -H "Content-Type: application/json" \
+        -H "Accept: application/json" \
+        --data @/tmp/jira_comment_body.json \
+        "${JIRA_URL}/rest/api/3/issue/${existing_key}/comment") || true
+      if [[ "${comment_http}" == "201" ]]; then
+        echo "✅ Comment added to ${existing_key}"
+      else
+        echo "⚠️  Comment on ${existing_key} returned HTTP ${comment_http}"
+        cat /tmp/jira_comment_resp.json 2>/dev/null || true
+      fi
+      echo "${existing_key}|${JIRA_URL}/browse/${existing_key}" >> /tmp/jira_created_tickets.txt
+      return 0
+  fi
+
+  echo "--- Creating new ticket for ${label_severity} ---"
+  local adf_body
+  adf_body=$(build_adf_body "${severity_key}" "${summary_line}" "" "${current_ids_json}")
+
+  jq -n \
+    --arg project  "${PROJECT_KEY}" \
+    --arg title    "${title}" \
+    --arg itype    "${ISSUE_TYPE}" \
+    --arg priority "${priority}" \
+    --arg lsev     "${label_severity}" \
+    --arg lrepo    "${REPO_SLUG}" \
+    --argjson desc "${adf_body}" \
+    '{fields: {project: {key: $project}, summary: $title, issuetype: {name: $itype},
+               priority: {name: $priority}, description: $desc,
+               labels: ["barbatos", "security", $lsev, $lrepo]}}' > /tmp/jira_payload.json
+
+  local create_http
+  create_http=$(curl -s -o /tmp/jira_create.json -w "%{http_code}" \
+    -X POST \
+    -H "Authorization: Basic ${AUTH}" \
+    -H "Content-Type: application/json" \
+    -H "Accept: application/json" \
+    --data @/tmp/jira_payload.json \
+    "${JIRA_URL}/rest/api/3/issue")
+
+  if [[ "${create_http}" == "201" ]]; then
+    local new_key
+    new_key=$(jq -r '.key' /tmp/jira_create.json)
+    echo "✅ Created JIRA ticket: ${new_key}"
+    echo "## ✅ JIRA Ticket Created" >> "${GITHUB_STEP_SUMMARY}"
+    echo "- Severity group: **${label_severity}**" >> "${GITHUB_STEP_SUMMARY}"
+    echo "- Ticket: [${new_key}](${JIRA_URL}/browse/${new_key})" >> "${GITHUB_STEP_SUMMARY}"
+    echo "${new_key}|${JIRA_URL}/browse/${new_key}" >> /tmp/jira_created_tickets.txt
+    link_jira_to_github "${new_key}"
+    store_jira_key_in_github "${label_severity}" "${new_key}"
+
+    # Assign to active sprint (best-effort).
+    local boards_http
+    boards_http=$(curl -s -o /tmp/jira_boards.json -w "%{http_code}" \
+      -H "Authorization: Basic ${AUTH}" \
+      -H "Accept: application/json" \
+      "${JIRA_URL}/rest/agile/1.0/board?projectKeyOrId=${PROJECT_KEY}&type=scrum&maxResults=1")
+    if [[ "${boards_http}" == "200" ]]; then
+      local board_id
+      board_id=$(jq -r '.values[0].id // empty' /tmp/jira_boards.json)
+      if [[ -n "${board_id}" ]]; then
+        local sprints_http
+        sprints_http=$(curl -s -o /tmp/jira_sprints.json -w "%{http_code}" \
+          -H "Authorization: Basic ${AUTH}" \
+          -H "Accept: application/json" \
+          "${JIRA_URL}/rest/agile/1.0/board/${board_id}/sprint?state=active&maxResults=1")
+        if [[ "${sprints_http}" == "200" ]]; then
+          local sprint_id sprint_name
+          sprint_id=$(jq -r '.values[0].id // empty' /tmp/jira_sprints.json)
+          sprint_name=$(jq -r '.values[0].name // "active sprint"' /tmp/jira_sprints.json)
+          if [[ -n "${sprint_id}" ]]; then
+            local move_http
+            move_http=$(curl -s -o /dev/null -w "%{http_code}" \
+              -X POST \
+              -H "Authorization: Basic ${AUTH}" \
+              -H "Content-Type: application/json" \
+              --data "{\"issues\":[\"${new_key}\"]}" \
+              "${JIRA_URL}/rest/agile/1.0/sprint/${sprint_id}/issue")
+            if [[ "${move_http}" == "204" ]]; then
+              echo "✅ Assigned ${new_key} to sprint: ${sprint_name}"
+              echo "- Sprint: **${sprint_name}**" >> "${GITHUB_STEP_SUMMARY}"
+            else
+              echo "⚠️  Could not assign to sprint (HTTP ${move_http}) — ticket in backlog"
+            fi
+          else
+            echo "⚠️  No active sprint for board ${board_id} — ticket in backlog"
+          fi
+        fi
+      fi
+    fi
+  else
+    echo "❌ Failed to create JIRA ticket (HTTP ${create_http})"
+    echo "$(cat /tmp/jira_create.json)"
+    echo "## ❌ JIRA Ticket Creation Failed" >> "${GITHUB_STEP_SUMMARY}"
+    echo "- Severity group: **${label_severity}**" >> "${GITHUB_STEP_SUMMARY}"
+    echo "- HTTP status: ${create_http}" >> "${GITHUB_STEP_SUMMARY}"
+  fi
+}
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+# Apply defaults for optional env vars.
+ISSUE_TYPE="${ISSUE_TYPE:-Bug}"
+# Strip any trailing slash from JIRA_URL to prevent double-slash in API paths.
+JIRA_URL="${JIRA_URL%/}"
+
+# ── Prefer post-suppression filtered findings if available ───────────────────
+# check-severity-gate.sh (and run-barbatos-scan-ci.sh) write a -filtered.json
+# sibling when .barbatos-ignore.yml suppression rules are applied.  Using it here
+# ensures JIRA tickets only reflect non-suppressed findings.
+_FILTERED_FILE="${FINDINGS_FILE%.json}-filtered.json"
+if [[ -f "${_FILTERED_FILE}" ]]; then
+  echo "✅ Post-suppression findings found — using: ${_FILTERED_FILE}"
+  FINDINGS_FILE="${_FILTERED_FILE}"
+  # Re-derive severity counts from the filtered file so ticket creation
+  # thresholds match the suppressed-findings view.
+  CRITICAL_COUNT=$(jq -r '.summary.total_critical // 0' "${FINDINGS_FILE}" 2>/dev/null || echo "0")
+  HIGH_COUNT=$(jq -r     '.summary.total_high     // 0' "${FINDINGS_FILE}" 2>/dev/null || echo "0")
+  MEDIUM_COUNT=$(jq -r   '.summary.total_medium   // 0' "${FINDINGS_FILE}" 2>/dev/null || echo "0")
+  LOW_COUNT=$(jq -r      '.summary.total_low      // 0' "${FINDINGS_FILE}" 2>/dev/null || echo "0")
+  echo "  Filtered counts — Critical: ${CRITICAL_COUNT} | High: ${HIGH_COUNT} | Medium: ${MEDIUM_COUNT} | Low: ${LOW_COUNT}"
+else
+  echo "ℹ️  No filtered findings file found — using raw findings: ${FINDINGS_FILE}"
+fi
+
+echo "=== JIRA Ticket Creation ==="
+echo "Project: ${PROJECT_KEY} | Repo: ${REPO_SLUG}"
+
+# Verify auth and project access.
+auth_http=$(curl -s -o /tmp/jira_myself.json -w "%{http_code}" \
+  -H "Authorization: Basic ${AUTH}" \
+  -H "Accept: application/json" \
+  "${JIRA_URL}/rest/api/3/myself")
+if [[ "${auth_http}" != "200" ]]; then
+  echo "❌ JIRA authentication failed (HTTP ${auth_http})."
+  cat /tmp/jira_myself.json
+  exit 1
+fi
+echo "✅ JIRA auth OK"
+
+proj_http=$(curl -s -o /tmp/jira_project.json -w "%{http_code}" \
+  -H "Authorization: Basic ${AUTH}" \
+  -H "Accept: application/json" \
+  "${JIRA_URL}/rest/api/3/project/${PROJECT_KEY}")
+if [[ "${proj_http}" != "200" ]]; then
+  echo "❌ JIRA project '${PROJECT_KEY}' not found (HTTP ${proj_http})."
+  cat /tmp/jira_project.json
+  exit 1
+fi
+echo "✅ JIRA project '${PROJECT_KEY}' accessible"
+
+# Titles intentionally omit the date — one stable title per severity+repo so label
+# searches reliably find the existing open ticket across multiple scan runs.
+# The date appears in the ticket description and in update comments.
+if [[ "${CRITICAL_COUNT:-0}" -gt 0 ]]; then
+  create_jira_ticket \
+    "BARBATOS Critical Security Findings - ${REPO_NAME##*/}" \
+    "barbatos-critical" "Highest" "critical_findings" \
+    "BARBATOS found ${CRITICAL_COUNT} critical severity finding(s) in ${REPO_NAME} on ${TODAY}."
+fi
+
+if [[ "${HIGH_COUNT:-0}" -gt 0 ]]; then
+  create_jira_ticket \
+    "BARBATOS High Security Findings - ${REPO_NAME##*/}" \
+    "barbatos-high" "High" "high_findings" \
+    "BARBATOS found ${HIGH_COUNT} high severity finding(s) in ${REPO_NAME} on ${TODAY}."
+fi
+
+if [[ "${MEDIUM_COUNT:-0}" -gt 0 ]]; then
+  create_jira_ticket \
+    "BARBATOS Medium Security Findings - ${REPO_NAME##*/}" \
+    "barbatos-medium" "Medium" "medium_findings" \
+    "BARBATOS found ${MEDIUM_COUNT} medium severity finding(s) in ${REPO_NAME} on ${TODAY}."
+fi
+
+if [[ "${LOW_COUNT:-0}" -gt 0 ]]; then
+  create_jira_ticket \
+    "BARBATOS Low Security Findings - ${REPO_NAME##*/}" \
+    "barbatos-low" "Low" "low_findings" \
+    "BARBATOS found ${LOW_COUNT} low severity finding(s) in ${REPO_NAME} on ${TODAY}."
+fi
