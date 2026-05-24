@@ -1,0 +1,1148 @@
+name: BARBATOS Security Scan (Reusable)
+
+# Reusable workflow that can be called from any repository's CI pipeline.
+# This allows repos to sequence security scanning after their build/test jobs,
+# enabling coverage artifacts to be passed through for SonarQube analysis.
+#
+# Usage (from caller):
+#   jobs:
+#     build:
+#       runs-on: self-hosted
+#       steps: ...  # build, test, upload coverage artifact
+#
+#     security-scan:
+#       needs: build
+#       uses: sketch0395/SRTM-tool/.github/workflows/security-scan-reusable.yml@main
+#       with:
+#         scan_mode: quick
+#         coverage_artifact: coverage-xml  # name of artifact from build job
+#       secrets: inherit
+
+on:
+  workflow_call:
+    inputs:
+      scan_mode:
+        description: 'Scan mode (quick/full/nightly/baseline); nightly=full+LLM (Garak)'
+        required: false
+        default: 'full'
+        type: string
+      subdirectory:
+        description: 'Optional: Subdirectory path to scan'
+        required: false
+        default: ''
+        type: string
+      repository_url:
+        description: 'Optional: External repository URL to scan (for public/external scans)'
+        required: false
+        default: ''
+        type: string
+      pr_number:
+        description: 'Optional: Pull request number to scan (GitHub repos, external scan mode)'
+        required: false
+        default: ''
+        type: string
+      target_ref:
+        description: 'Optional: Branch/tag/commit to scan (external scan mode)'
+        required: false
+        default: ''
+        type: string
+      coverage_artifact:
+        description: 'Name of coverage artifact from a prior job (downloaded via gh CLI)'
+        required: false
+        default: ''
+        type: string
+      fail_on_critical:
+        description: 'Fail build on critical severity findings'
+        required: false
+        default: true
+        type: boolean
+      fail_on_high:
+        description: 'Fail build on high severity findings'
+        required: false
+        default: true
+        type: boolean
+      warning_only:
+        description: 'Report vulnerabilities but never fail the build'
+        required: false
+        default: false
+        type: boolean
+      garak_target_type:
+        description: 'Garak generator type (for example: test, openai, huggingface)'
+        required: false
+        default: 'openai'
+        type: string
+      garak_target_name:
+        description: 'Garak target model name (for example: test.Blank, gpt-4o-mini)'
+        required: false
+        default: 'gpt-4o-mini'
+        type: string
+      garak_probes:
+        description: 'Comma-separated Garak probes or probe groups'
+        required: false
+        default: 'promptinject,dan,knownbadsignatures,encoding,continuation'
+        type: string
+      skip_garak:
+        description: 'Skip Garak LLM security probing (Layer 12)'
+        required: false
+        default: false
+        type: boolean
+      run_garak:
+        description: 'Explicitly run (true) or skip (false) Garak; when set, overrides skip_garak and event-based defaults'
+        required: false
+        default: ''
+        type: string
+      skip_sbom:
+        description: 'Skip Layer 1 - SBOM generation'
+        required: false
+        default: false
+        type: boolean
+      skip_trufflehog:
+        description: 'Skip Layer 2 - Secret detection (TruffleHog)'
+        required: false
+        default: false
+        type: boolean
+      skip_sonar:
+        description: 'Skip Layer 3 - Code quality (SonarQube)'
+        required: false
+        default: false
+        type: boolean
+      skip_clamav:
+        description: 'Skip Layer 4 - Malware detection (ClamAV)'
+        required: false
+        default: false
+        type: boolean
+      skip_helm:
+        description: 'Skip Layer 5 - Helm chart build'
+        required: false
+        default: false
+        type: boolean
+      skip_checkov:
+        description: 'Skip Layer 6 - Infrastructure security (Checkov)'
+        required: false
+        default: false
+        type: boolean
+      skip_trivy:
+        description: 'Skip Layer 7 - Container security (Trivy)'
+        required: false
+        default: false
+        type: boolean
+      skip_grype:
+        description: 'Skip Layer 8 - Vulnerability detection (Grype)'
+        required: false
+        default: false
+        type: boolean
+      skip_xeol:
+        description: 'Skip Layer 9 - End-of-life detection (Xeol)'
+        required: false
+        default: false
+        type: boolean
+      skip_anchore:
+        description: 'Skip Layer 10 - Anchore security'
+        required: false
+        default: false
+        type: boolean
+      skip_api_discovery:
+        description: 'Skip Layer 11 - API discovery'
+        required: false
+        default: false
+        type: boolean
+      create_github_issue:
+        description: 'Create a GitHub issue for critical and high severity findings'
+        required: false
+        default: true
+        type: boolean
+      create_jira_tickets:
+        description: 'Disable JIRA ticket creation even when secrets are present (set to false to skip)'
+        required: false
+        default: true
+        type: boolean
+      jira_project_key:
+        description: 'JIRA project key to create tickets in (e.g. SEC, INFRA)'
+        required: false
+        default: ''
+        type: string
+      jira_issue_type:
+        description: 'JIRA issue type for created tickets'
+        required: false
+        default: 'Bug'
+        type: string
+      pr_base_branch:
+        description: 'Base branch to count merged PRs for the metrics chart (default: main)'
+        required: false
+        default: 'main'
+        type: string
+      write_metrics:
+        description: 'Write and upload a metrics row for this scan'
+        required: false
+        default: true
+        type: boolean
+    secrets:
+      OPENAI_API_KEY:
+        description: 'OpenAI API key for Garak LLM security probing'
+        required: false
+      ANTHROPIC_API_KEY:
+        description: 'Anthropic API key for Garak LLM security probing'
+        required: false
+      JIRA_BASE_URL:
+        description: 'Jira Cloud base URL (e.g. https://yourcompany.atlassian.net)'
+        required: false
+      JIRA_USER_EMAIL:
+        description: 'Email address associated with the Jira API token'
+        required: false
+      JIRA_API_TOKEN:
+        description: 'Jira Cloud personal API token'
+        required: false
+      JIRA_PROJECT_KEY:
+        description: 'Jira project key (e.g. SAP, SEC). Takes precedence over the jira_project_key input.'
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  security-scan:
+    name: Run BARBATOS Security Analysis
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: write
+      security-events: write
+      issues: write
+
+    env:
+      SCAN_MODE: "${{ inputs.scan_mode }}"
+      FAIL_ON_CRITICAL: "${{ inputs.fail_on_critical }}"
+      FAIL_ON_HIGH: "${{ inputs.fail_on_high }}"
+      WARNING_ONLY: "${{ inputs.warning_only }}"
+      NOTIFY_USERS: "${{ vars.NOTIFY_USERS }}"
+      GARAK_TARGET_TYPE: "${{ inputs.garak_target_type }}"
+      GARAK_TARGET_NAME: "${{ inputs.garak_target_name }}"
+      GARAK_PROBES: "${{ inputs.garak_probes }}"
+      GARAK_TIMEOUT: "300"
+      GARAK_GENERATIONS: "5"
+      SKIP_GARAK: "${{ inputs.skip_garak }}"
+      RUN_GARAK: "${{ inputs.run_garak }}"
+      SKIP_SBOM: "${{ inputs.skip_sbom }}"
+      SKIP_TRUFFLEHOG: "${{ inputs.skip_trufflehog }}"
+      SKIP_SONAR: "${{ inputs.skip_sonar }}"
+      SKIP_CLAMAV: "${{ inputs.skip_clamav }}"
+      SKIP_HELM: "${{ inputs.skip_helm }}"
+      SKIP_CHECKOV: "${{ inputs.skip_checkov }}"
+      SKIP_TRIVY: "${{ inputs.skip_trivy }}"
+      SKIP_GRYPE: "${{ inputs.skip_grype }}"
+      SKIP_XEOL: "${{ inputs.skip_xeol }}"
+      SKIP_ANCHORE: "${{ inputs.skip_anchore }}"
+      SKIP_API_DISCOVERY: "${{ inputs.skip_api_discovery }}"
+      CREATE_GITHUB_ISSUE: "${{ inputs.create_github_issue }}"
+      CREATE_JIRA_TICKETS: "${{ inputs.create_jira_tickets }}"  # true by default; set to false to disable
+      JIRA_PROJECT_KEY: "${{ secrets.JIRA_PROJECT_KEY || inputs.jira_project_key }}"
+      JIRA_ISSUE_TYPE: "${{ inputs.jira_issue_type }}"
+      JIRA_BASE_URL: "${{ secrets.JIRA_BASE_URL }}"
+      JIRA_USER_EMAIL: "${{ secrets.JIRA_USER_EMAIL }}"
+      JIRA_API_TOKEN: "${{ secrets.JIRA_API_TOKEN }}"
+
+    steps:
+      - name: Checkout Target Repository
+        if: inputs.repository_url == ''
+        uses: actions/checkout@v5
+        with:
+          path: target-repo
+          fetch-depth: 0
+
+      - name: Clone External Target Repository
+        if: inputs.repository_url != ''
+        run: |
+          REPO_URL="${{ inputs.repository_url }}"
+          SUBDIR="${{ inputs.subdirectory }}"
+          PR_NUMBER="${{ inputs.pr_number }}"
+          TARGET_REF="${{ inputs.target_ref }}"
+          CHECKOUT_TARGET=""
+
+          if [[ -n "$PR_NUMBER" ]]; then
+            CHECKOUT_TARGET="refs/pull/${PR_NUMBER}/merge"
+            echo "🎯 Targeting PR #$PR_NUMBER ($CHECKOUT_TARGET)"
+          elif [[ -n "$TARGET_REF" ]]; then
+            CHECKOUT_TARGET="$TARGET_REF"
+            echo "🎯 Targeting ref: $TARGET_REF"
+          fi
+
+          if [[ -n "$SUBDIR" ]]; then
+            echo "📥 Cloning repository with sparse-checkout (subdirectory: $SUBDIR)"
+            git clone --filter=blob:none --sparse "$REPO_URL" target-repo
+            cd target-repo
+
+            if [[ -n "$CHECKOUT_TARGET" ]]; then
+              git fetch origin "$CHECKOUT_TARGET"
+              git checkout --detach FETCH_HEAD
+            fi
+
+            git sparse-checkout set "$SUBDIR"
+            cd ..
+          else
+            echo "📥 Cloning full repository"
+            git clone "$REPO_URL" target-repo
+            if [[ -n "$CHECKOUT_TARGET" ]]; then
+              cd target-repo
+              git fetch origin "$CHECKOUT_TARGET"
+              git checkout --detach FETCH_HEAD
+              cd ..
+            fi
+          fi
+
+      - name: Checkout BARBATOS Security Scanner
+        uses: actions/checkout@v5
+        with:
+          repository: sketch0395/SRTM-tool
+          path: barbatos
+          fetch-depth: 1
+
+      - name: Download coverage artifact
+        if: inputs.coverage_artifact != ''
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "📥 Downloading coverage artifact: ${{ inputs.coverage_artifact }}"
+          gh run download "$GITHUB_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name "${{ inputs.coverage_artifact }}" \
+            --dir target-repo \
+          && echo "✅ Coverage artifact downloaded" \
+          || echo "⚠️ Coverage artifact not available — SonarQube will run without coverage data"
+
+          # Rewrite absolute <source> paths in coverage.xml so SonarQube can
+          # map them to the checkout directory on this runner.
+          if [[ -f target-repo/coverage.xml ]]; then
+            CHECKOUT_DIR="${{ github.workspace }}/target-repo"
+            echo "🔧 Rewriting coverage.xml source paths → $CHECKOUT_DIR"
+            sed -i -E "s|<source>[^<]+</source>|<source>${CHECKOUT_DIR}</source>|g" target-repo/coverage.xml
+          fi
+
+      - name: Free Disk Space
+        run: |
+          echo "📊 Disk usage before cleanup:"
+          df -h /
+          # Remove large pre-installed toolchains not needed for security scanning
+          sudo rm -rf /usr/local/lib/android \
+                      /usr/local/share/boost \
+                      /usr/share/dotnet \
+                      /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL \
+                      /usr/local/.ghcup \
+                      /usr/lib/jvm \
+                      /usr/share/swift \
+                      /usr/local/share/chromium \
+                      /usr/local/share/powershell \
+                      /usr/local/lib/node_modules \
+                      /var/lib/snapd 2>/dev/null || true
+          sudo apt-get clean
+          docker image prune -af --filter "until=1h" 2>/dev/null || true
+          echo "📊 Disk usage after cleanup:"
+          df -h /
+
+      - name: Set up Docker
+        uses: docker/setup-buildx-action@v3
+
+      - name: Cache Docker Images
+        uses: actions/cache@v5
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-docker-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-docker-
+
+      - name: Pull Security Tool Images
+        run: |
+          mkdir -p /tmp/.buildx-cache
+          # Pull images sequentially to avoid racing for disk space.
+          # dhi.io images require authentication — skip if not available.
+          for image in \
+            anchore/grype:latest \
+            ghcr.io/aquasecurity/trivy:latest \
+            trufflesecurity/trufflehog:latest \
+            anchore/syft:latest \
+            clamav/clamav:latest \
+            bridgecrew/checkov:latest \
+            noqcks/xeol:latest; do
+            echo "⏬ Pulling $image..."
+            docker pull "$image" || echo "⚠️  Failed to pull $image — will be pulled on demand or skipped"
+          done
+          echo "✅ Security tool images ready"
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq python3 python3-pip bats
+          pip3 install pyyaml pipdeptree
+
+      - name: Initialize Scan
+        id: init-scan
+        env:
+          TARGET_NAME: ${{ github.event.repository.name }}
+          GITHUB_ACTOR: ${{ github.actor }}
+          SUBDIR: ${{ inputs.subdirectory }}
+          REPOSITORY_URL_INPUT: ${{ inputs.repository_url }}
+        run: |
+          cd barbatos
+          chmod +x scripts/shell/run-target-security-scan.sh
+
+          BARBATOS_VERSION=$(tr -d '[:space:]' < VERSION 2>/dev/null || echo "unknown")
+          echo "Using BARBATOS scanner version: $BARBATOS_VERSION"
+
+          TARGET_NAME_DEFAULT="$TARGET_NAME"
+          if [[ -n "$REPOSITORY_URL_INPUT" ]]; then
+            TARGET_NAME_DEFAULT=$(basename "$REPOSITORY_URL_INPUT" .git)
+          fi
+
+          if [[ -n "$SUBDIR" ]]; then
+            TARGET_DIR="${{ github.workspace }}/target-repo/$SUBDIR"
+            TARGET_NAME=$(basename "$SUBDIR")
+            echo "🎯 Scanning subdirectory: $SUBDIR"
+          else
+            TARGET_DIR="${{ github.workspace }}/target-repo"
+            TARGET_NAME="$TARGET_NAME_DEFAULT"
+            echo "🎯 Scanning full repository: $TARGET_NAME"
+          fi
+
+          echo "TARGET_DIR=$TARGET_DIR" > /tmp/barbatos-env
+          echo "SCAN_MODE=$SCAN_MODE" >> /tmp/barbatos-env
+          echo "TARGET_NAME=$TARGET_NAME" >> /tmp/barbatos-env
+          echo "GITHUB_ACTOR=$GITHUB_ACTOR" >> /tmp/barbatos-env
+          echo "SUBDIR=$SUBDIR" >> /tmp/barbatos-env
+          echo "BARBATOS_VERSION=$BARBATOS_VERSION" >> /tmp/barbatos-env
+          echo "GARAK_TARGET_TYPE=${GARAK_TARGET_TYPE:-openai}" >> /tmp/barbatos-env
+          echo "GARAK_TARGET_NAME=${GARAK_TARGET_NAME:-gpt-4o-mini}" >> /tmp/barbatos-env
+          echo "GARAK_PROBES=${GARAK_PROBES:-promptinject,dan,knownbadsignatures,encoding,continuation}" >> /tmp/barbatos-env
+
+          # Per-tool skip flags
+          echo "SKIP_SBOM=${SKIP_SBOM:-false}" >> /tmp/barbatos-env
+          echo "SKIP_TRUFFLEHOG=${SKIP_TRUFFLEHOG:-false}" >> /tmp/barbatos-env
+          echo "SKIP_SONAR=${SKIP_SONAR:-false}" >> /tmp/barbatos-env
+          echo "SKIP_CLAMAV=${SKIP_CLAMAV:-false}" >> /tmp/barbatos-env
+          echo "SKIP_HELM=${SKIP_HELM:-false}" >> /tmp/barbatos-env
+          echo "SKIP_CHECKOV=${SKIP_CHECKOV:-false}" >> /tmp/barbatos-env
+          echo "SKIP_TRIVY=${SKIP_TRIVY:-false}" >> /tmp/barbatos-env
+          echo "SKIP_GRYPE=${SKIP_GRYPE:-false}" >> /tmp/barbatos-env
+          echo "SKIP_XEOL=${SKIP_XEOL:-false}" >> /tmp/barbatos-env
+          echo "SKIP_ANCHORE=${SKIP_ANCHORE:-false}" >> /tmp/barbatos-env
+          echo "SKIP_API_DISCOVERY=${SKIP_API_DISCOVERY:-false}" >> /tmp/barbatos-env
+
+          # Propagate RUN_GARAK to SKIP_GARAK for legacy consumers; run_garak_layer reads RUN_GARAK directly.
+          if [[ "${RUN_GARAK}" == "true" ]];  then echo "SKIP_GARAK=false" >> "$GITHUB_ENV"; fi
+          if [[ "${RUN_GARAK}" == "false" ]]; then echo "SKIP_GARAK=true"  >> "$GITHUB_ENV"; fi
+
+          TIMESTAMP=$(date +%Y-%m-%d_%H-%M-%S)
+          SCAN_NAME="${TARGET_NAME}_${TIMESTAMP}"
+          SCAN_DIR="scans/${SCAN_NAME}"
+          mkdir -p "$SCAN_DIR"
+          echo "SCAN_DIR=$PWD/$SCAN_DIR" >> /tmp/barbatos-env
+          echo "SCAN_NAME=$SCAN_NAME" >> /tmp/barbatos-env
+          echo "SCAN_ID=$SCAN_NAME" >> /tmp/barbatos-env
+          echo "scan_dir=$SCAN_DIR" >> $GITHUB_OUTPUT
+          echo "scan_id=$SCAN_NAME" >> $GITHUB_OUTPUT
+          echo "🚀 Initialized scan: $SCAN_NAME"
+
+      - name: Free Disk Space (pre-scan)
+        if: always()
+        run: |
+          # Prune Docker resources that are no longer needed after image pull.
+          # This typically recovers 8-15 GB on ubuntu-latest before Layer 12
+          # (Garak) attempts to install torch + transformers (~2 GB unpacked).
+          echo "Disk before cleanup:"
+          df -h / | tail -1
+          docker image prune -af  2>/dev/null || true
+          docker container prune -f 2>/dev/null || true
+          docker volume prune -f  2>/dev/null || true
+          docker builder prune -af 2>/dev/null || true
+          # Clear pip wheel cache so large cached wheels don't consume space twice.
+          python3 -m pip cache purge 2>/dev/null || true
+          echo "Disk after cleanup:"
+          df -h / | tail -1
+
+      - name: Run Security Layers (CI Orchestrator)
+        id: run-scan
+        continue-on-error: true
+        env:
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_ORGANIZATION: ${{ vars.SONAR_ORGANIZATION }}
+          SONAR_PROJECT_KEY: ${{ vars.SONAR_PROJECT_KEY }}
+          SONAR_PR_NUMBER: ${{ github.event.pull_request.number }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANCHORE_BUILD_TIMEOUT: "900"
+          ANCHORE_SKIP_BUILD: "true"
+        run: |
+          # Append API keys to /tmp/barbatos-env so they are explicitly exported to all subshells.
+          [[ -n "${OPENAI_API_KEY:-}" ]]    && echo "OPENAI_API_KEY=${OPENAI_API_KEY}"       >> /tmp/barbatos-env
+          [[ -n "${ANTHROPIC_API_KEY:-}" ]] && echo "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}" >> /tmp/barbatos-env
+          chmod +x barbatos/scripts/shell/run-barbatos-scan-ci.sh
+          ./barbatos/scripts/shell/run-barbatos-scan-ci.sh
+
+      - name: Check Severity Gate
+        run: |
+          cd barbatos
+          if [ -f /tmp/barbatos-env ]; then
+            set -a
+            source /tmp/barbatos-env
+            set +a
+          fi
+          export FAIL_ON_CRITICAL="${{ env.FAIL_ON_CRITICAL }}"
+          export FAIL_ON_HIGH="${{ env.FAIL_ON_HIGH }}"
+          export WARNING_ONLY="${{ env.WARNING_ONLY }}"
+          chmod +x scripts/shell/check-severity-gate.sh
+          ./scripts/shell/check-severity-gate.sh
+
+      - name: Generate Reports & Dashboard
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd barbatos
+          if [ -f /tmp/barbatos-env ]; then
+            source /tmp/barbatos-env
+          fi
+          SCAN_DIR="${{ steps.run-scan.outputs.scan_dir }}"
+          echo "📊 Generating consolidated reports and dashboard..."
+          echo "DEBUG: SCAN_DIR = $SCAN_DIR"
+          echo "DEBUG: Before consolidation, manifest files:"
+          ls -la "$SCAN_DIR"/scan-manifest* "$SCAN_DIR"/manifest-summary* 2>&1 || echo "Manifest files not found before consolidation!"
+          chmod +x scripts/shell/consolidate-security-reports.sh
+          SCAN_DIR="$SCAN_DIR" TARGET_DIR="$TARGET_DIR" ./scripts/shell/consolidate-security-reports.sh || echo "Report generation completed with warnings"
+          echo "DEBUG: After consolidation, manifest files in consolidated-reports:"
+          ls -la "$SCAN_DIR/consolidated-reports"/scan-manifest* "$SCAN_DIR/consolidated-reports"/manifest-summary* 2>&1 || echo "Manifest files not found in consolidated-reports!"
+
+          # ─── Embed 90-day metrics trend into dashboard ────────────────────
+          DASHBOARD_FILE="$SCAN_DIR/consolidated-reports/dashboards/security-dashboard.html"
+          METRICS_90D_FILE="$SCAN_DIR/scan-metrics-90d.json"
+
+          if [ -f "$DASHBOARD_FILE" ]; then
+            echo "📈 Adding 90-day metrics trend to dashboard..."
+            echo "${GH_TOKEN}" | gh auth login --with-token >/dev/null 2>&1 || true
+            SINCE_DATE=$(date -u -d '90 days ago' +%Y-%m-%d 2>/dev/null || date -u -v-90d +%Y-%m-%d)
+            echo "Looking for scans since: $SINCE_DATE"
+
+            chmod +x scripts/shell/get-scan-metrics.sh scripts/shell/embed-metrics-in-dashboard.sh
+
+            # Collect metrics (without --quiet so we see what was found)
+            if ./scripts/shell/get-scan-metrics.sh \
+              --github-only \
+              --from-github "${{ github.repository }}" \
+              --since "$SINCE_DATE" \
+              --output "$METRICS_90D_FILE"; then
+              echo "✅ Metrics collected successfully"
+            else
+              echo "⚠️ Metrics aggregation completed with warnings (see above)"
+            fi
+
+            if [ -s "$METRICS_90D_FILE" ]; then
+              # Resolve base branch: use input override if set, otherwise auto-detect from repo API
+              PR_REPO="${{ inputs.repository_url || github.repository }}"
+              PR_REPO=$(echo "$PR_REPO" | sed 's|https://github.com/||; s|/$||')
+              OVERRIDE_BRANCH="${{ inputs.pr_base_branch }}"
+              if [ -n "$OVERRIDE_BRANCH" ]; then
+                PR_BASE_BRANCH="$OVERRIDE_BRANCH"
+              else
+                PR_BASE_BRANCH=$(gh api "repos/${PR_REPO}" --jq '.default_branch' 2>/dev/null || echo "main")
+              fi
+              echo "📊 Counting PRs merged to: ${PR_BASE_BRANCH} (repo: ${PR_REPO})"
+              ./scripts/shell/embed-metrics-in-dashboard.sh \
+                --metrics "$METRICS_90D_FILE" \
+                --dashboard "$DASHBOARD_FILE" \
+                --chart-type bar \
+                --max-points 90 \
+                --pr-repo "$PR_REPO" \
+                --pr-base-branch "$PR_BASE_BRANCH" \
+                --pr-since "$SINCE_DATE" \
+                || echo "⚠️ Dashboard metrics embedding completed with warnings"
+              echo "✅ Metrics embedding step completed"
+            else
+              echo "⚠️ No metrics data available for embedding"
+            fi
+          fi
+
+      - name: Fix Artifact Permissions
+        if: always()
+        run: |
+          cd barbatos
+          SCAN_DIR="${{ steps.run-scan.outputs.scan_dir }}"
+          if [ -d "$SCAN_DIR" ]; then
+            echo "Fixing permissions for: $SCAN_DIR"
+            sudo chown -R runner:docker "$SCAN_DIR" || true
+            sudo chmod -R a+r "$SCAN_DIR" || true
+            sudo find "$SCAN_DIR" -type d -exec chmod a+rx {} \; || true
+            if [ -d "$SCAN_DIR/clamav" ]; then
+              ls -la "$SCAN_DIR/clamav/"
+            fi
+          fi
+
+      - name: Generate Summary
+        if: always()
+        run: |
+          cd barbatos
+          if [ -f /tmp/barbatos-env ]; then
+            source /tmp/barbatos-env
+          fi
+          SCAN_DIR="${{ steps.run-scan.outputs.scan_dir }}"
+          GARAK_RESULTS_FILE="$SCAN_DIR/garak/garak-results.json"
+
+          echo "**BARBATOS Version:** \`${BARBATOS_VERSION:-unknown}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "### 🤖 Garak LLM Scan" >> $GITHUB_STEP_SUMMARY
+          if [ -f "$GARAK_RESULTS_FILE" ]; then
+            GARAK_STATUS=$(jq -r '.status // "unknown"' "$GARAK_RESULTS_FILE" 2>/dev/null || echo "unknown")
+            GARAK_TARGET_TYPE=$(jq -r '.target_type // "n/a"' "$GARAK_RESULTS_FILE" 2>/dev/null || echo "n/a")
+            GARAK_TARGET_NAME=$(jq -r '.target_name // "n/a"' "$GARAK_RESULTS_FILE" 2>/dev/null || echo "n/a")
+            GARAK_RUNTIME_TARGET=$(jq -r '.runtime_target // "n/a"' "$GARAK_RESULTS_FILE" 2>/dev/null || echo "n/a")
+            GARAK_RUNTIME_CLASSIFICATION=$(jq -r '.runtime_classification // "n/a"' "$GARAK_RESULTS_FILE" 2>/dev/null || echo "n/a")
+            GARAK_TARGET_ORIGIN=$(jq -r '.target_origin // "n/a"' "$GARAK_RESULTS_FILE" 2>/dev/null || echo "n/a")
+            GARAK_PROBES=$(jq -r '.probes // "n/a"' "$GARAK_RESULTS_FILE" 2>/dev/null || echo "n/a")
+            GARAK_EXIT_CODE=$(jq -r '.exit_code // "n/a"' "$GARAK_RESULTS_FILE" 2>/dev/null || echo "n/a")
+            GARAK_HIT_LOG=$(jq -r '.hit_log // empty' "$GARAK_RESULTS_FILE" 2>/dev/null || true)
+            GARAK_HIT_COUNT="0"
+            if [ -n "$GARAK_HIT_LOG" ] && [ -f "$SCAN_DIR/garak/$GARAK_HIT_LOG" ]; then
+              GARAK_HIT_COUNT=$(wc -l < "$SCAN_DIR/garak/$GARAK_HIT_LOG" | tr -d '[:space:]')
+            fi
+            echo "- Status: \`$GARAK_STATUS\`" >> $GITHUB_STEP_SUMMARY
+            echo "- Target: \`$GARAK_TARGET_TYPE\` / \`$GARAK_TARGET_NAME\`" >> $GITHUB_STEP_SUMMARY
+            echo "- Runtime target: \`$GARAK_RUNTIME_TARGET\`" >> $GITHUB_STEP_SUMMARY
+            echo "- Runtime class: \`$GARAK_RUNTIME_CLASSIFICATION\`" >> $GITHUB_STEP_SUMMARY
+            echo "- Target origin: \`$GARAK_TARGET_ORIGIN\`" >> $GITHUB_STEP_SUMMARY
+            echo "- Probes: \`$GARAK_PROBES\`" >> $GITHUB_STEP_SUMMARY
+            echo "- Probe hits: \`$GARAK_HIT_COUNT\`" >> $GITHUB_STEP_SUMMARY
+            echo "- Exit code: \`$GARAK_EXIT_CODE\`" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- Garak results were not generated in this run." >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ -f "$SCAN_DIR/consolidated-reports/markdown-reports/executive-summary.md" ]; then
+            cat "$SCAN_DIR/consolidated-reports/markdown-reports/executive-summary.md" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Write Metrics Row
+        if: always() && inputs.write_metrics != false && (inputs.scan_mode == 'nightly' || github.event_name == 'workflow_dispatch')
+        run: |
+          cd barbatos
+          SCAN_DIR="${{ steps.run-scan.outputs.scan_dir }}"
+          FINDINGS_JSON="$SCAN_DIR/security-findings-summary.json"
+
+          CRITICAL=0; HIGH=0; MEDIUM=0; LOW=0
+          HAS_FINDINGS=false
+          if [ -f "$FINDINGS_JSON" ]; then
+            HAS_FINDINGS=true
+            CRITICAL=$(jq -r '.summary.total_critical // 0' "$FINDINGS_JSON" 2>/dev/null || echo 0)
+            HIGH=$(jq -r     '.summary.total_high     // 0' "$FINDINGS_JSON" 2>/dev/null || echo 0)
+            MEDIUM=$(jq -r   '.summary.total_medium   // 0' "$FINDINGS_JSON" 2>/dev/null || echo 0)
+            LOW=$(jq -r      '.summary.total_low      // 0' "$FINDINGS_JSON" 2>/dev/null || echo 0)
+          fi
+
+          jq -cn \
+            --arg  scan_id        "${{ steps.run-scan.outputs.scan_id }}" \
+            --arg  target_name    "${{ inputs.repository_url || github.repository }}" \
+            --arg  scan_type      "${{ inputs.scan_mode }}" \
+            --arg  scan_user      "${{ github.actor }}" \
+            --arg  scan_timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg  repository     "${{ github.repository }}" \
+            --arg  run_id         "${{ github.run_id }}" \
+            --arg  run_url        "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --argjson critical    "$CRITICAL" \
+            --argjson high        "$HIGH" \
+            --argjson medium      "$MEDIUM" \
+            --argjson low         "$LOW" \
+            --argjson has_findings "$HAS_FINDINGS" \
+            '{
+              scan_id:             $scan_id,
+              target_name:         $target_name,
+              scan_type:           $scan_type,
+              scan_user:           $scan_user,
+              scan_timestamp:      $scan_timestamp,
+              repository:          $repository,
+              run_id:              $run_id,
+              run_url:             $run_url,
+              has_findings_summary:$has_findings,
+              critical:            $critical,
+              high:                $high,
+              medium:              $medium,
+              low:                 $low
+            }' > "$SCAN_DIR/scan-metrics.json"
+
+      - name: Enrich Findings with NVD + CISA KEV
+        if: always()
+        env:
+          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+          SCAN_DIR: ${{ steps.run-scan.outputs.scan_dir }}
+        run: |
+          cd barbatos
+          chmod +x scripts/shell/enrich-findings.sh
+          scripts/shell/enrich-findings.sh || true
+
+      - name: Upload Complete Scan Results
+        uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: ${{ steps.run-scan.outputs.scan_id }}
+          path: barbatos/${{ steps.run-scan.outputs.scan_dir }}/
+          retention-days: 30
+
+      - name: Upload Metrics Row
+        uses: actions/upload-artifact@v5
+        if: always() && inputs.write_metrics != false && (inputs.scan_mode == 'nightly' || github.event_name == 'workflow_dispatch')
+        with:
+          name: metrics-${{ steps.run-scan.outputs.scan_id }}
+          path: barbatos/${{ steps.run-scan.outputs.scan_dir }}/scan-metrics.json
+          if-no-files-found: warn
+          retention-days: 90
+
+      - name: Check for Critical/High Vulnerabilities
+        id: check-severity
+        if: always()
+        run: |
+          cd barbatos
+          SCAN_DIR="${{ steps.run-scan.outputs.scan_dir }}"
+
+          # Default outputs — always written so downstream steps are never skipped due to empty outputs
+          CRITICAL=0
+          HIGH=0
+          MEDIUM=0
+          LOW=0
+
+          # Prefer the filtered JSON (suppressed tools removed) if it exists, then the
+          # deduplicated full summary, then executive-summary.md as a last resort.
+          FILTERED_JSON="$SCAN_DIR/security-findings-filtered.json"
+          FINDINGS_JSON="$SCAN_DIR/security-findings-summary.json"
+          ACTIVE_JSON="$FINDINGS_JSON"
+          if [ -f "$FILTERED_JSON" ]; then
+            ACTIVE_JSON="$FILTERED_JSON"
+            echo "DEBUG: Using filtered findings (suppressed tools excluded): $FILTERED_JSON"
+          fi
+          if [ -f "$ACTIVE_JSON" ]; then
+            CRITICAL=$(jq -r '.summary.total_critical // 0' "$ACTIVE_JSON")
+            HIGH=$(jq -r '.summary.total_high // 0' "$ACTIVE_JSON")
+            MEDIUM=$(jq -r '.summary.total_medium // 0' "$ACTIVE_JSON")
+            LOW=$(jq -r '.summary.total_low // 0' "$ACTIVE_JSON")
+            echo "DEBUG: Read from $(basename $ACTIVE_JSON) — Critical=$CRITICAL High=$HIGH Medium=$MEDIUM Low=$LOW"
+          else
+            # Fall back to executive-summary.md
+            SUMMARY="$SCAN_DIR/consolidated-reports/markdown-reports/executive-summary.md"
+            if [ -f "$SUMMARY" ]; then
+              CRITICAL=$(grep -oP 'Critical:\s*\K\d+' "$SUMMARY" | head -1 || echo "0")
+              HIGH=$(grep -oP 'High:\s*\K\d+' "$SUMMARY" | head -1 || echo "0")
+              MEDIUM=$(grep -oP 'Medium:\s*\K\d+' "$SUMMARY" | head -1 || echo "0")
+              LOW=$(grep -oP 'Low:\s*\K\d+' "$SUMMARY" | head -1 || echo "0")
+              CRITICAL=${CRITICAL:-0}
+              HIGH=${HIGH:-0}
+              MEDIUM=${MEDIUM:-0}
+              LOW=${LOW:-0}
+              echo "DEBUG: Read from executive-summary.md — Critical=$CRITICAL High=$HIGH Medium=$MEDIUM Low=$LOW"
+            else
+              echo "WARNING: Neither security-findings-summary.json nor executive-summary.md found in $SCAN_DIR"
+              echo "DEBUG: Contents of $SCAN_DIR:"
+              ls -la "$SCAN_DIR" 2>/dev/null || echo "(directory not found)"
+            fi
+          fi
+
+          echo "critical=$CRITICAL" >> $GITHUB_OUTPUT
+          echo "high=$HIGH" >> $GITHUB_OUTPUT
+          echo "medium=$MEDIUM" >> $GITHUB_OUTPUT
+          echo "low=$LOW" >> $GITHUB_OUTPUT
+
+          if [ "${CRITICAL:-0}" -gt 0 ] || [ "${HIGH:-0}" -gt 0 ] || [ "${MEDIUM:-0}" -gt 0 ] || [ "${LOW:-0}" -gt 0 ]; then
+            echo "has_issues=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_issues=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Comment on PR
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const summaryPath = 'barbatos/${{ steps.run-scan.outputs.scan_dir }}/consolidated-reports/markdown-reports/executive-summary.md';
+
+            if (fs.existsSync(summaryPath)) {
+              const summary = fs.readFileSync(summaryPath, 'utf8');
+              const critical = parseInt('${{ steps.check-severity.outputs.critical }}' || '0');
+              const high = parseInt('${{ steps.check-severity.outputs.high }}' || '0');
+              const medium = parseInt('${{ steps.check-severity.outputs.medium }}' || '0');
+              const low = parseInt('${{ steps.check-severity.outputs.low }}' || '0');
+
+              let emoji = '✅';
+              let status = 'No security issues found';
+
+              if (critical > 0 || high > 0) {
+                emoji = '⚠️';
+                status = `Found ${critical} critical and ${high} high severity issues`;
+              } else if (medium > 0 || low > 0) {
+                emoji = '🟡';
+                status = `Found ${medium} medium and ${low} low severity issues`;
+              }
+
+              const notifyUsers = '${{ env.NOTIFY_USERS }}'.split(',').map(u => `@${u.trim()}`).join(' ');
+
+              // Build skipped-scans list from SKIP_* env vars
+              const skipMap = {
+                'Garak LLM':      '${{ env.SKIP_GARAK }}' === 'true',
+                'SBOM':           '${{ env.SKIP_SBOM }}' === 'true',
+                'TruffleHog':     '${{ env.SKIP_TRUFFLEHOG }}' === 'true',
+                'SonarQube':      '${{ env.SKIP_SONAR }}' === 'true',
+                'ClamAV':         '${{ env.SKIP_CLAMAV }}' === 'true',
+                'Helm':           '${{ env.SKIP_HELM }}' === 'true',
+                'Checkov':        '${{ env.SKIP_CHECKOV }}' === 'true',
+                'Trivy':          '${{ env.SKIP_TRIVY }}' === 'true',
+                'Grype':          '${{ env.SKIP_GRYPE }}' === 'true',
+                'Xeol':           '${{ env.SKIP_XEOL }}' === 'true',
+                'Anchore':        '${{ env.SKIP_ANCHORE }}' === 'true',
+                'API Discovery':  '${{ env.SKIP_API_DISCOVERY }}' === 'true',
+              };
+              const skippedScans = Object.entries(skipMap).filter(([,v]) => v).map(([k]) => k);
+              const skippedSection = skippedScans.length > 0
+                ? `\n> ⏭️ **Skipped scans:** ${skippedScans.join(', ')}\n`
+                : '';
+
+              const comment = `## ${emoji} BARBATOS Security Scan Results
+
+              ${status}
+              ${skippedSection}
+              **Triggered by:** ${{ github.actor }}
+              **Notifying:** ${notifyUsers}
+
+              <details>
+              <summary>📊 Executive Summary</summary>
+
+              ${summary}
+
+              </details>
+
+              ### 📦 Artifacts
+              - [Security Dashboard](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+              - [HTML Reports](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+              - [Markdown Reports](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+              `;
+
+              github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: comment
+              });
+            }
+
+      - name: Create Scan Notification Issues
+        id: create-github-issue
+        if: always() && steps.check-severity.outputs.has_issues == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+
+            // ── Only @mention users listed in NOTIFY_USERS — never broader team mentions ──
+            const notifyMentions = ('${{ env.NOTIFY_USERS }}' || '')
+              .split(',').map(u => u.trim()).filter(Boolean).map(u => `@${u}`).join(' ');
+
+            const triggeredBy  = '${{ github.actor }}'; // username only — no @ to avoid notifying actor
+            const repository   = '${{ github.repository }}';
+            const repoName     = repository.split('/')[1];
+            const scanMode     = '${{ env.SCAN_MODE }}';
+            const runUrl       = `https://github.com/${repository}/actions/runs/${{ github.run_id }}`;
+            const today        = new Date().toISOString().split('T')[0];
+
+            const critical = parseInt('${{ steps.check-severity.outputs.critical }}') || 0;
+            const high     = parseInt('${{ steps.check-severity.outputs.high }}')     || 0;
+            const medium   = parseInt('${{ steps.check-severity.outputs.medium }}')   || 0;
+            const low      = parseInt('${{ steps.check-severity.outputs.low }}')      || 0;
+
+            // ── Load the findings JSON produced by the scan ─────────────────────────────
+            // Prefer the filtered version (suppressed tools removed) if it exists.
+            const filteredPath = 'barbatos/${{ steps.run-scan.outputs.scan_dir }}/security-findings-filtered.json';
+            const findingsPath = 'barbatos/${{ steps.run-scan.outputs.scan_dir }}/security-findings-summary.json';
+            const activePath = fs.existsSync(filteredPath) ? filteredPath : findingsPath;
+            let findingsData = {};
+            if (fs.existsSync(activePath)) {
+              try { findingsData = JSON.parse(fs.readFileSync(activePath, 'utf8')); }
+              catch (e) { console.warn(`Could not parse findings JSON: ${e.message}`); }
+            }
+
+            // ── Per-severity config: one GitHub issue is maintained per severity level ─
+            const SEVERITIES = [
+              { key: 'critical', label: 'critical',        emoji: '🔴', count: critical, findingsKey: 'critical_findings', labelName: 'Critical' },
+              { key: 'high',     label: 'high-severity',   emoji: '🟠', count: high,     findingsKey: 'high_findings',     labelName: 'High'     },
+              { key: 'medium',   label: 'medium-severity', emoji: '🟡', count: medium,   findingsKey: 'medium_findings',   labelName: 'Medium'   },
+              { key: 'low',      label: 'low-severity',    emoji: '🔵', count: low,      findingsKey: 'low_findings',      labelName: 'Low'      },
+            ];
+
+            // The tracking marker is an invisible HTML comment embedded in issue/comment
+            // bodies so we can tell which vulnerability IDs were previously reported.
+            function extractStoredVulnIds(body) {
+              if (!body) return [];
+              const m = body.match(/<!--barbatos-vuln-ids:([\s\S]*?)-->/);
+              if (!m) return [];
+              try { return JSON.parse(m[1]); } catch { return []; }
+            }
+
+            function findingId(f) {
+              return f.vulnerability_id || f.check_id || f.detector || 'unknown';
+            }
+
+            function buildFindingsTable(sevFindings) {
+              if (!sevFindings || sevFindings.length === 0) return '_No findings._';
+              const header = '| ID / CVE | Package / File | Version | Tool | Description |\n|----------|----------------|---------|------|-------------|';
+              const rows = sevFindings.map(f => {
+                const id   = findingId(f);
+                const pkg  = (f.package_name || f.file_path || f.file || 'N/A').substring(0, 60);
+                const ver  = f.package_version || '-';
+                const tool = f.tool || 'N/A';
+                const desc = (f.description || '').substring(0, 100);
+                const kev  = f.cisa_kev ? ' 🔥 KEV' : '';
+                return `| \`${id}\`${kev} | ${pkg} | ${ver} | ${tool} | ${desc} |`;
+              });
+              return `${header}\n${rows.join('\n')}`;
+            }
+
+            function buildIssueBody(sev, sevFindings, vulnIds) {
+              let triggerLabel = 'Manual';
+              if ('${{ github.event_name }}' === 'schedule')         triggerLabel = 'Scheduled Scan';
+              else if ('${{ github.event_name }}' === 'push')        triggerLabel = 'Push to ${{ github.ref_name }}';
+              else if ('${{ github.event_name }}' === 'pull_request') triggerLabel = 'Pull Request #${{ github.event.pull_request.number }}';
+              const steps = (sev.key === 'critical' || sev.key === 'high')
+                ? '1. ⚠️ **Review these findings immediately**\n2. Download the security dashboard from the workflow run\n3. Prioritize remediation by severity'
+                : '1. Review scan results\n2. Keep dependencies up to date';
+              return [
+                `${sev.emoji} **[BARBATOS] ${sev.labelName} Security Findings**`,
+                '',
+                `**Repository:** \`${repository}\``,
+                `**Scan Mode:** \`${scanMode}\``,
+                `**Trigger:** ${triggerLabel}`,
+                `**Triggered by:** ${triggeredBy}`,
+                notifyMentions ? `**Notifying:** ${notifyMentions}` : '',
+                '',
+                '---',
+                '',
+                `### 📊 ${sev.labelName} Severity Findings (${sev.count})`,
+                '',
+                buildFindingsTable(sevFindings),
+                '',
+                '---',
+                '',
+                '### 🔗 Resources',
+                `- [View Workflow Run](${runUrl})`,
+                '',
+                '### 🔧 Next Steps',
+                steps,
+                '',
+                '---',
+                `*🤖 Automated notification from BARBATOS Security Scanner — first reported ${today}*`,
+                '',
+                `<!--barbatos-vuln-ids:${JSON.stringify(vulnIds)}-->`,
+              ].filter(l => l !== null).join('\n');
+            }
+
+            function buildUpdateComment(sev, newFindings, allCurrentVulnIds) {
+              return [
+                `### 🔄 New ${sev.labelName} Findings — ${today}`,
+                '',
+                `${newFindings.length} new vulnerability/vulnerabilities detected since last scan:`,
+                '',
+                buildFindingsTable(newFindings),
+                '',
+                `[View Workflow Run](${runUrl}) · Triggered by ${triggeredBy}`,
+                notifyMentions ? `\n**Notifying:** ${notifyMentions}` : '',
+                '',
+                `<!--barbatos-vuln-ids:${JSON.stringify(allCurrentVulnIds)}-->`,
+              ].filter(l => l !== null).join('\n');
+            }
+
+            // ── Process each severity level independently ─────────────────────────────
+            let firstIssueNumber = '';
+            let firstIssueUrl    = '';
+
+            for (const sev of SEVERITIES) {
+              if (sev.count === 0) continue;
+
+              const sevFindings    = findingsData[sev.findingsKey] || [];
+              const currentVulnIds = [...new Set(sevFindings.map(findingId))];
+
+              // Search for an existing open issue for this exact severity level.
+              const { data: existingList } = await github.rest.issues.listForRepo({
+                owner:    context.repo.owner,
+                repo:     context.repo.repo,
+                state:    'open',
+                labels:   `security-scan,barbatos,${sev.label}`,
+                per_page: 1,
+              });
+
+              if (existingList.length > 0) {
+                const issue = existingList[0];
+
+                // Extract the set of previously tracked vuln IDs from the most recent
+                // bot comment, or fall back to the issue body if no comments exist yet.
+                const { data: comments } = await github.rest.issues.listComments({
+                  owner:        context.repo.owner,
+                  repo:         context.repo.repo,
+                  issue_number: issue.number,
+                  per_page:     100,
+                });
+                const botComments = comments.filter(c => c.user.type === 'Bot').reverse();
+                const lastBody    = botComments.length > 0 ? botComments[0].body : issue.body;
+                const prevVulnIds = extractStoredVulnIds(lastBody);
+
+                // Only post a comment when there are vulnerability IDs not yet reported.
+                const newVulnIds = currentVulnIds.filter(id => !prevVulnIds.includes(id));
+                if (newVulnIds.length === 0) {
+                  console.log(`[${sev.key}] No new vulnerabilities (${currentVulnIds.length} already tracked) — skipping`);
+                  if (!firstIssueNumber) { firstIssueNumber = String(issue.number); firstIssueUrl = issue.html_url; }
+                  continue;
+                }
+
+                console.log(`[${sev.key}] ${newVulnIds.length} new vuln(s) — commenting on #${issue.number}`);
+                const newFindings = sevFindings.filter(f => newVulnIds.includes(findingId(f)));
+                await github.rest.issues.createComment({
+                  owner:        context.repo.owner,
+                  repo:         context.repo.repo,
+                  issue_number: issue.number,
+                  body:         buildUpdateComment(sev, newFindings, currentVulnIds),
+                });
+                if (!firstIssueNumber) { firstIssueNumber = String(issue.number); firstIssueUrl = issue.html_url; }
+
+              } else {
+                // No open issue for this severity — create one now.
+                console.log(`[${sev.key}] No existing open issue — creating`);
+                const body = buildIssueBody(sev, sevFindings, currentVulnIds);
+                const { data: newIssue } = await github.rest.issues.create({
+                  owner:  context.repo.owner,
+                  repo:   context.repo.repo,
+                  title:  `${sev.emoji} [BARBATOS] ${sev.labelName} Security Findings — ${repoName}`,
+                  body,
+                  labels: ['security-scan', 'barbatos', sev.label, 'security'],
+                });
+                console.log(`[${sev.key}] Created issue #${newIssue.number}: ${newIssue.html_url}`);
+                if (!firstIssueNumber) { firstIssueNumber = String(newIssue.number); firstIssueUrl = newIssue.html_url; }
+              }
+            }
+
+            if (firstIssueNumber) {
+              core.setOutput('issue_number', firstIssueNumber);
+              core.setOutput('issue_url', firstIssueUrl);
+            }
+
+      - name: Create JIRA Tickets for Critical/High Findings
+        if: >
+          always() &&
+          (inputs.scan_mode == 'full' || inputs.scan_mode == 'nightly') &&
+          steps.check-severity.outputs.has_issues == 'true' &&
+          env.JIRA_BASE_URL != '' &&
+          env.JIRA_USER_EMAIL != '' &&
+          env.JIRA_API_TOKEN != '' &&
+          env.CREATE_JIRA_TICKETS != 'false'
+        shell: bash
+        env:
+          GITHUB_ISSUE_URL: ${{ steps.create-github-issue.outputs.issue_url }}
+          GITHUB_ISSUE_NUMBER: ${{ steps.create-github-issue.outputs.issue_number }}
+          FINDINGS_FILE: barbatos/${{ steps.run-scan.outputs.scan_dir }}/security-findings-filtered.json
+          FINDINGS_FILE_FALLBACK: barbatos/${{ steps.run-scan.outputs.scan_dir }}/security-findings-summary.json
+          JIRA_URL: ${{ env.JIRA_BASE_URL }}
+          PROJECT_KEY: ${{ env.JIRA_PROJECT_KEY }}
+          ISSUE_TYPE: ${{ env.JIRA_ISSUE_TYPE }}
+          REPO_NAME: ${{ github.repository }}
+          CRITICAL_COUNT: ${{ steps.check-severity.outputs.critical }}
+          HIGH_COUNT: ${{ steps.check-severity.outputs.high }}
+          MEDIUM_COUNT: ${{ steps.check-severity.outputs.medium }}
+          LOW_COUNT: ${{ steps.check-severity.outputs.low }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Prefer filtered findings (suppressed tools removed); fall back to full summary.
+          if [ ! -f "${FINDINGS_FILE}" ] && [ -f "${FINDINGS_FILE_FALLBACK}" ]; then
+            export FINDINGS_FILE="${FINDINGS_FILE_FALLBACK}"
+          fi
+          AUTH=$(echo -n "${JIRA_USER_EMAIL}:${JIRA_API_TOKEN}" | base64 -w0)
+          REPO_SLUG=$(echo "${REPO_NAME}" | tr '/' '-' | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')
+          TODAY=$(date -u +"%Y-%m-%d")
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          export AUTH REPO_SLUG TODAY RUN_URL ISSUE_TYPE
+          chmod +x barbatos/scripts/shell/create-jira-tickets.sh
+          ./barbatos/scripts/shell/create-jira-tickets.sh
+
+      - name: Link Jira Tickets to GitHub Issue
+        if: >
+          always() &&
+          (inputs.scan_mode == 'full' || inputs.scan_mode == 'nightly') &&
+          steps.create-github-issue.outputs.issue_number != '' &&
+          env.JIRA_BASE_URL != '' &&
+          env.JIRA_API_TOKEN != '' &&
+          env.CREATE_JIRA_TICKETS != 'false'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const issueNumber = parseInt('${{ steps.create-github-issue.outputs.issue_number }}');
+            if (!issueNumber) { console.log('No GitHub issue number — skipping Jira link comment'); return; }
+
+            const ticketsFile = '/tmp/jira_created_tickets.txt';
+            if (!fs.existsSync(ticketsFile)) {
+              console.log('No Jira tickets were created this run — skipping link comment');
+              return;
+            }
+
+            const lines = fs.readFileSync(ticketsFile, 'utf8').trim().split('\n').filter(Boolean);
+            if (!lines.length) { console.log('Jira tickets file is empty — skipping'); return; }
+
+            const jiraBaseUrl = '${{ env.JIRA_BASE_URL }}';
+            const ticketLinks = lines.map(line => {
+              const [key, url] = line.split('|');
+              return `- [${key}](${url})`;
+            }).join('\n');
+
+            const comment = [
+              '### 🎫 Jira Tickets Created',
+              '',
+              'The following Jira tickets were opened for these security findings:',
+              '',
+              ticketLinks,
+              '',
+              '_Each Jira ticket also carries a remote link back to this issue._',
+            ].join('\n');
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              body: comment,
+            });
+            console.log(`Posted ${lines.length} Jira ticket link(s) to GitHub issue #${issueNumber}`);
+
+            // Update the GitHub issue title to include the JIRA key(s)
+            const keys = lines.map(line => line.split('|')[0]).filter(Boolean);
+            if (keys.length > 0) {
+              const currentIssue = await github.rest.issues.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+              });
+              const currentTitle = currentIssue.data.title;
+              const jiraPrefix = keys.join(', ');
+              // Only prepend if not already present
+              if (!currentTitle.startsWith(jiraPrefix)) {
+                const newTitle = `${jiraPrefix}: ${currentTitle}`;
+                await github.rest.issues.update({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issueNumber,
+                  title: newTitle,
+                });
+                console.log(`Updated issue #${issueNumber} title to: ${newTitle}`);
+              }
+            }
+
+      - name: Fail on Critical Vulnerabilities
+        if: always() && steps.check-severity.outputs.critical > 0
+        run: |
+          echo "::error::Found ${{ steps.check-severity.outputs.critical }} critical vulnerabilities"
+          exit 1
