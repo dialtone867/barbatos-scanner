@@ -507,7 +507,7 @@ jobs:
           if [ -f /tmp/barbatos-env ]; then
             source /tmp/barbatos-env
           fi
-          SCAN_DIR="${{ steps.run-scan.outputs.scan_dir }}"
+          SCAN_DIR="${{ steps.init-scan.outputs.scan_dir }}"
           echo "📊 Generating consolidated reports and dashboard..."
           echo "DEBUG: SCAN_DIR = $SCAN_DIR"
           echo "DEBUG: Before consolidation, manifest files:"
@@ -570,7 +570,7 @@ jobs:
         if: always()
         run: |
           cd barbatos
-          SCAN_DIR="${{ steps.run-scan.outputs.scan_dir }}"
+          SCAN_DIR="${{ steps.init-scan.outputs.scan_dir }}"
           if [ -d "$SCAN_DIR" ]; then
             echo "Fixing permissions for: $SCAN_DIR"
             sudo chown -R runner:docker "$SCAN_DIR" || true
@@ -588,7 +588,7 @@ jobs:
           if [ -f /tmp/barbatos-env ]; then
             source /tmp/barbatos-env
           fi
-          SCAN_DIR="${{ steps.run-scan.outputs.scan_dir }}"
+          SCAN_DIR="${{ steps.init-scan.outputs.scan_dir }}"
           GARAK_RESULTS_FILE="$SCAN_DIR/garak/garak-results.json"
 
           echo "**BARBATOS Version:** \`${BARBATOS_VERSION:-unknown}\`" >> $GITHUB_STEP_SUMMARY
@@ -630,7 +630,7 @@ jobs:
         if: always() && inputs.write_metrics != false && (inputs.scan_mode == 'nightly' || github.event_name == 'workflow_dispatch')
         run: |
           cd barbatos
-          SCAN_DIR="${{ steps.run-scan.outputs.scan_dir }}"
+          SCAN_DIR="${{ steps.init-scan.outputs.scan_dir }}"
           FINDINGS_JSON="$SCAN_DIR/security-findings-summary.json"
 
           CRITICAL=0; HIGH=0; MEDIUM=0; LOW=0
@@ -644,7 +644,7 @@ jobs:
           fi
 
           jq -cn \
-            --arg  scan_id        "${{ steps.run-scan.outputs.scan_id }}" \
+            --arg  scan_id        "${{ steps.init-scan.outputs.scan_id }}" \
             --arg  target_name    "${{ inputs.repository_url || github.repository }}" \
             --arg  scan_type      "${{ inputs.scan_mode }}" \
             --arg  scan_user      "${{ github.actor }}" \
@@ -677,7 +677,7 @@ jobs:
         if: always()
         env:
           NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
-          SCAN_DIR: ${{ steps.run-scan.outputs.scan_dir }}
+          SCAN_DIR: ${{ steps.init-scan.outputs.scan_dir }}
         run: |
           cd barbatos
           chmod +x scripts/shell/enrich-findings.sh
@@ -687,16 +687,16 @@ jobs:
         uses: actions/upload-artifact@v5
         if: always()
         with:
-          name: ${{ steps.run-scan.outputs.scan_id }}
-          path: barbatos/${{ steps.run-scan.outputs.scan_dir }}/
+          name: ${{ steps.init-scan.outputs.scan_id }}
+          path: barbatos/${{ steps.init-scan.outputs.scan_dir }}/
           retention-days: 30
 
       - name: Upload Metrics Row
         uses: actions/upload-artifact@v5
         if: always() && inputs.write_metrics != false && (inputs.scan_mode == 'nightly' || github.event_name == 'workflow_dispatch')
         with:
-          name: metrics-${{ steps.run-scan.outputs.scan_id }}
-          path: barbatos/${{ steps.run-scan.outputs.scan_dir }}/scan-metrics.json
+          name: metrics-${{ steps.init-scan.outputs.scan_id }}
+          path: barbatos/${{ steps.init-scan.outputs.scan_dir }}/scan-metrics.json
           if-no-files-found: warn
           retention-days: 90
 
@@ -705,7 +705,7 @@ jobs:
         if: always()
         run: |
           cd barbatos
-          SCAN_DIR="${{ steps.run-scan.outputs.scan_dir }}"
+          SCAN_DIR="${{ steps.init-scan.outputs.scan_dir }}"
 
           # Default outputs — always written so downstream steps are never skipped due to empty outputs
           CRITICAL=0
@@ -765,7 +765,7 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-            const summaryPath = 'barbatos/${{ steps.run-scan.outputs.scan_dir }}/consolidated-reports/markdown-reports/executive-summary.md';
+            const summaryPath = 'barbatos/${{ steps.init-scan.outputs.scan_dir }}/consolidated-reports/markdown-reports/executive-summary.md';
 
             if (fs.existsSync(summaryPath)) {
               const summary = fs.readFileSync(summaryPath, 'utf8');
@@ -861,8 +861,8 @@ jobs:
 
             // ── Load the findings JSON produced by the scan ─────────────────────────────
             // Prefer the filtered version (suppressed tools removed) if it exists.
-            const filteredPath = 'barbatos/${{ steps.run-scan.outputs.scan_dir }}/security-findings-filtered.json';
-            const findingsPath = 'barbatos/${{ steps.run-scan.outputs.scan_dir }}/security-findings-summary.json';
+            const filteredPath = 'barbatos/${{ steps.init-scan.outputs.scan_dir }}/security-findings-filtered.json';
+            const findingsPath = 'barbatos/${{ steps.init-scan.outputs.scan_dir }}/security-findings-summary.json';
             const activePath = fs.existsSync(filteredPath) ? filteredPath : findingsPath;
             let findingsData = {};
             if (fs.existsSync(activePath)) {
@@ -1045,8 +1045,8 @@ jobs:
         env:
           GITHUB_ISSUE_URL: ${{ steps.create-github-issue.outputs.issue_url }}
           GITHUB_ISSUE_NUMBER: ${{ steps.create-github-issue.outputs.issue_number }}
-          FINDINGS_FILE: barbatos/${{ steps.run-scan.outputs.scan_dir }}/security-findings-filtered.json
-          FINDINGS_FILE_FALLBACK: barbatos/${{ steps.run-scan.outputs.scan_dir }}/security-findings-summary.json
+          FINDINGS_FILE: barbatos/${{ steps.init-scan.outputs.scan_dir }}/security-findings-filtered.json
+          FINDINGS_FILE_FALLBACK: barbatos/${{ steps.init-scan.outputs.scan_dir }}/security-findings-summary.json
           JIRA_URL: ${{ env.JIRA_BASE_URL }}
           PROJECT_KEY: ${{ env.JIRA_PROJECT_KEY }}
           ISSUE_TYPE: ${{ env.JIRA_ISSUE_TYPE }}
