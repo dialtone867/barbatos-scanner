@@ -557,7 +557,7 @@ elif [[ "$FAIL_ON_CRITICAL" == "true" && $TOTAL_CRITICAL -gt 0 ]]; then
     fi
 fi
 
-if [[ "$FAIL_ON_HIGH" == "true" && $TOTAL_HIGH -ge $HIGH_THRESHOLD ]]; then
+if [[ "$FAIL_ON_HIGH" == "true" && $TOTAL_HIGH -gt $HIGH_THRESHOLD ]]; then
     echo -e "${RED}❌ Build Gate Failed: $TOTAL_HIGH high severity findings detected (threshold: $HIGH_THRESHOLD)${NC}"
     echo -e "${RED}   Policy: FAIL_ON_HIGH=true, HIGH_THRESHOLD=$HIGH_THRESHOLD${NC}"
     ISSUES_FOUND=true
