@@ -1,0 +1,73 @@
+name: Private Security Scan
+
+# BARBATOS integrated security scanner.
+# Scripts are vendored in scripts/shell/ — no external repo dependency.
+
+permissions:
+  contents: read
+
+on:
+  schedule:
+    # Nightly run at 2 AM UTC
+    - cron: '0 2 * * *'
+  # checkov:skip=CKV_GHA_7:Workflow inputs control scan parameters not build artifacts
+  workflow_dispatch:
+    inputs:
+      subdirectory:
+        description: 'Optional: Subdirectory path to scan (e.g., apps/api)'
+        required: false
+        type: string
+      scan_mode:
+        description: 'Scan mode (quick/full/nightly/baseline)'
+        required: false
+        default: 'full'
+        type: choice
+        options:
+          - quick
+          - full
+          - nightly
+          - baseline
+      garak_target_type:
+        description: 'Garak generator type (e.g. test, openai, huggingface)'
+        required: false
+        default: 'openai'
+        type: string
+      garak_target_name:
+        description: 'Garak target model name (e.g. gpt-4o-mini)'
+        required: false
+        default: 'gpt-4o-mini'
+        type: string
+      garak_probes:
+        description: 'Garak probe set'
+        required: false
+        default: 'promptinject,dan,knownbadsignatures,encoding,continuation'
+        type: choice
+        options:
+          - promptinject,dan,knownbadsignatures,encoding,continuation
+          - promptinject
+          - dan
+          - encoding
+          - knownbadsignatures
+          - xss
+          - lmrc
+          - all
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  security-scan:
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: write
+      security-events: write
+      issues: write
+    uses: dialtone867/barbatos-scanner/.github/workflows/security-scan-reusable.yml@main
+    with:
+      scan_mode: ${{ github.event_name == 'schedule' && 'nightly' || inputs.scan_mode || 'full' }}
+      subdirectory: ${{ inputs.subdirectory || '' }}
+      garak_target_type: ${{ inputs.garak_target_type || 'openai' }}
+      garak_target_name: ${{ inputs.garak_target_name || 'gpt-4o-mini' }}
+      garak_probes: ${{ inputs.garak_probes || 'promptinject' }}
+    secrets: inherit
