@@ -138,6 +138,21 @@ on:
         required: false
         default: true
         type: boolean
+      barbatos_callback_url:
+        description: 'SRTM-tool webhook URL to POST scan results back to (omit for standalone use)'
+        required: false
+        default: ''
+        type: string
+      barbatos_job_id:
+        description: 'Job ID issued by SRTM-tool security-scan-trigger (passed through from workflow_dispatch)'
+        required: false
+        default: ''
+        type: string
+      barbatos_webhook_secret:
+        description: 'Shared secret for SRTM-tool webhook validation'
+        required: false
+        default: ''
+        type: string
     secrets:
       OPENAI_API_KEY:
         description: 'OpenAI API key for Garak LLM security probing'
@@ -189,6 +204,9 @@ jobs:
       SKIP_ANCHORE: "${{ inputs.skip_anchore }}"
       SKIP_API_DISCOVERY: "${{ inputs.skip_api_discovery }}"
       CREATE_GITHUB_ISSUE: "${{ inputs.create_github_issue }}"
+      BARBATOS_CALLBACK_URL: "${{ inputs.barbatos_callback_url }}"
+      BARBATOS_JOB_ID: "${{ inputs.barbatos_job_id }}"
+      BARBATOS_WEBHOOK_SECRET: "${{ inputs.barbatos_webhook_secret }}"
 
     steps:
       - name: Checkout Target Repository
@@ -771,6 +789,42 @@ jobs:
               core.setOutput('issue_number', firstIssueNumber);
               core.setOutput('issue_url', firstIssueUrl);
             }
+
+      - name: Post Results to SRTM-tool
+        if: always() && env.BARBATOS_CALLBACK_URL != ''
+        env:
+          SCAN_DIR_PATH: barbatos/${{ steps.init-scan.outputs.scan_dir }}
+        run: |
+          JOB_ID="${BARBATOS_JOB_ID}"
+          SECRET="${BARBATOS_WEBHOOK_SECRET}"
+          URL="${BARBATOS_CALLBACK_URL}"
+          HEADERS=(-H "X-Barbatos-Job-Id: ${JOB_ID}")
+          [[ -n "$SECRET" ]] && HEADERS+=(-H "X-Barbatos-Secret: ${SECRET}")
+          HEADERS+=(-H "Content-Type: application/json")
+
+          post_tool() {
+            local tool="$1" file="$2"
+            if [[ -f "$file" ]]; then
+              echo "📤 Posting ${tool} results to SRTM-tool..."
+              content=$(cat "$file")
+              payload=$(jq -cn --arg tool "$tool" --argjson content "$content" '{tool: $tool, content: $content}')
+              http_code=$(curl -s -o /dev/null -w "%{http_code}" -X POST "${URL}" "${HEADERS[@]}" -d "$payload" || echo "000")
+              echo "   → HTTP ${http_code}"
+            fi
+          }
+
+          post_tool grype        "${SCAN_DIR_PATH}/grype/grype-filesystem-results.json"
+          post_tool trivy        "${SCAN_DIR_PATH}/trivy/trivy-filesystem-results.json"
+          post_tool trufflehog   "${SCAN_DIR_PATH}/trufflehog/trufflehog-results.json"
+          post_tool checkov      "${SCAN_DIR_PATH}/checkov/checkov-results.json"
+          post_tool xeol         "${SCAN_DIR_PATH}/xeol/xeol-results.json"
+          post_tool syft         "${SCAN_DIR_PATH}/sbom/sbom-results.json"
+          post_tool anchore      "${SCAN_DIR_PATH}/anchore/anchore-results.json"
+
+          # Send done signal
+          echo "📤 Sending done signal to SRTM-tool..."
+          curl -s -o /dev/null -w "done → HTTP %{http_code}\n" -X POST "${URL}" "${HEADERS[@]}" \
+            -d '{"done":true}' || true
 
       - name: Fail on Critical Vulnerabilities
         if: always() && steps.check-severity.outputs.critical > 0

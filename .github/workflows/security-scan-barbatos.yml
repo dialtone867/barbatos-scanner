@@ -45,7 +45,7 @@
 #
 # ── NOTE ─────────────────────────────────────────────────────────────────────
 #   Scanning scripts (Syft, Grype, Trivy, TruffleHog, Checkov, Xeol, etc.) are
-#   hosted in the public repo sketch0395/barbatos-scanner under scripts/shell/.
+#   hosted in the public repo dialtone867/barbatos-scanner under scripts/shell/.
 #   No token or secret is needed to check out that repo.
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -110,7 +110,7 @@ jobs:
       - name: Checkout BARBATOS scan engine
         uses: actions/checkout@v4
         with:
-          repository: sketch0395/barbatos-scanner
+          repository: dialtone867/barbatos-scanner
           path: security-scan
           fetch-depth: 1
 
