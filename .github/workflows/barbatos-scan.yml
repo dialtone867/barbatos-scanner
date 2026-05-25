@@ -1,0 +1,155 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# barbatos-scan.yml — BARBATOS Security Scanner
+#
+# ── DO YOU NEED TO EDIT THIS FILE? ───────────────────────────────────────────
+#   NO — copy this file as-is into .github/workflows/barbatos-scan.yml in your
+#   repository and commit it. All scan logic lives in the public
+#   dialtone867/barbatos-scanner repo. No other files are required.
+#
+# ── ONE-TIME SETUP ────────────────────────────────────────────────────────────
+#
+#   STEP 1 — Add this file to your repository:
+#     Copy to:  .github/workflows/barbatos-scan.yml
+#     Commit and push to your default branch (main / master).
+#     GitHub Actions picks it up automatically.
+#
+#   STEP 2 — Create a GitHub Personal Access Token (PAT):
+#     BARBATOS needs a PAT to trigger the workflow on your behalf.
+#
+#     Option A  Fine-grained token (recommended — least privilege):
+#       https://github.com/settings/personal-access-tokens/new
+#       • Resource owner : the org or user that owns the target repo
+#       • Repository access : select the specific repo(s) to scan
+#       • Repository permissions to enable:
+#           Actions    → Read and Write   (to dispatch workflow_dispatch)
+#           Contents   → Read-only        (to read the workflow file)
+#       • Set an expiration you're comfortable with (90 days is sensible).
+#       Copy the generated token and paste it into the BARBATOS security-scan form.
+#
+#     Option B  Classic token (simpler, broader):
+#       https://github.com/settings/tokens/new
+#       • Check  repo  (full control of private repositories)
+#       • Check  workflow  (update GitHub Action workflows)
+#       Note: classic tokens grant broad access — use fine-grained when possible.
+#
+#   STEP 3 — (Optional) set a webhook secret for request validation:
+#     In your repository: Settings → Secrets and variables → Actions → New secret
+#     Name:   BARBATOS_WEBHOOK_SECRET
+#     Value:  any long random string (e.g. openssl rand -hex 32)
+#     Enter the same value in the BARBATOS security-scan → "Webhook Secret" field.
+#     If you skip this step, all scan callbacks are accepted without validation.
+#
+# ── THAT'S IT ─────────────────────────────────────────────────────────────────
+#   Return to BARBATOS, fill in Repo Owner, Repo Name, and your PAT,
+#   then click "Trigger Scan".  BARBATOS handles the rest.
+#
+# ── HOW IT WORKS ──────────────────────────────────────────────────────────────
+#   • When triggered by BARBATOS (barbatos_callback_url is set):
+#     The barbatos-triggered job runs, posting results back to your BARBATOS
+#     instance in real-time as each scan layer completes.
+#
+#   • When triggered on a nightly schedule or manually without BARBATOS inputs:
+#     The ci-scan job runs a full security scan and saves results as GitHub
+#     Actions artifacts. Download and upload them via the BARBATOS Upload tab.
+#
+# ── NOTE ──────────────────────────────────────────────────────────────────────
+#   Scanning scripts (Syft, Grype, Trivy, TruffleHog, Checkov, Xeol, etc.) are
+#   hosted in the public repo dialtone867/barbatos-scanner under scripts/shell/.
+#   No token or secret is needed to check out that repo.
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: BARBATOS Security Scan
+
+permissions:
+  contents: read
+
+on:
+  schedule:
+    # Nightly run at 2 AM UTC
+    - cron: '0 2 * * *'
+  # checkov:skip=CKV_GHA_7:Workflow inputs control scan parameters not build artifacts
+  workflow_dispatch:
+    inputs:
+      # ── BARBATOS webhook inputs (set automatically by BARBATOS) ─────────────
+      barbatos_callback_url:
+        description: 'BARBATOS webhook endpoint — set automatically when triggered from BARBATOS (leave blank for CI/nightly mode)'
+        required: false
+      barbatos_job_id:
+        description: 'Job ID issued by BARBATOS — set automatically when triggered from BARBATOS'
+        required: false
+      barbatos_webhook_secret:
+        description: 'Shared webhook secret (leave blank if not set, or store as BARBATOS_WEBHOOK_SECRET repo secret)'
+        required: false
+      # ── CI / nightly scan inputs (used when barbatos_callback_url is not set) ─
+      subdirectory:
+        description: 'Optional: Subdirectory path to scan (e.g., apps/api)'
+        required: false
+        type: string
+      scan_mode:
+        description: 'Scan mode (quick/full/nightly/baseline)'
+        required: false
+        default: 'full'
+        type: choice
+        options:
+          - quick
+          - full
+          - nightly
+          - baseline
+      garak_target_type:
+        description: 'Garak generator type (e.g. test, openai, huggingface)'
+        required: false
+        default: 'openai'
+        type: string
+      garak_target_name:
+        description: 'Garak target model name (e.g. gpt-4o-mini)'
+        required: false
+        default: 'gpt-4o-mini'
+        type: string
+      garak_probes:
+        description: 'Garak probe set'
+        required: false
+        default: 'promptinject,dan,knownbadsignatures,encoding,continuation'
+        type: choice
+        options:
+          - promptinject,dan,knownbadsignatures,encoding,continuation
+          - promptinject
+          - dan
+          - encoding
+          - knownbadsignatures
+          - xss
+          - lmrc
+          - all
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  # ── BARBATOS-triggered mode: results posted back to your BARBATOS instance ───
+  barbatos-triggered:
+    if: github.event_name == 'workflow_dispatch' && inputs.barbatos_callback_url != ''
+    uses: dialtone867/barbatos-scanner/.github/workflows/barbatos-scan-reusable.yml@main
+    with:
+      barbatos_callback_url: ${{ inputs.barbatos_callback_url }}
+      barbatos_job_id:       ${{ inputs.barbatos_job_id }}
+      scan_mode:             ${{ inputs.scan_mode || 'full' }}
+      expected_scans:        '9'
+    secrets:
+      barbatos_webhook_secret: ${{ inputs.barbatos_webhook_secret || secrets.BARBATOS_WEBHOOK_SECRET }}
+
+  # ── CI / nightly mode: results saved as GitHub Actions artifacts ─────────────
+  ci-scan:
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.barbatos_callback_url == '')
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: write
+      security-events: write
+      issues: write
+    uses: dialtone867/barbatos-scanner/.github/workflows/security-scan-reusable.yml@main
+    with:
+      scan_mode: ${{ github.event_name == 'schedule' && 'nightly' || inputs.scan_mode || 'full' }}
+      subdirectory: ${{ inputs.subdirectory || '' }}
+      garak_target_type: ${{ inputs.garak_target_type || 'openai' }}
+      garak_target_name: ${{ inputs.garak_target_name || 'gpt-4o-mini' }}
+      garak_probes: ${{ inputs.garak_probes || 'promptinject' }}
+    secrets: inherit
