@@ -1,7 +1,8 @@
-name: Private Security Scan
+name: BARBATOS Security Scan
 
-# BARBATOS integrated security scanner.
-# Scripts are vendored in scripts/shell/ — no external repo dependency.
+# Drop this file into .github/workflows/ in any repo you want to scan.
+# It calls the BARBATOS reusable workflow — no other setup required.
+# Secrets (SONAR_TOKEN, OPENAI_API_KEY, etc.) are passed via "secrets: inherit".
 
 permissions:
   contents: read
