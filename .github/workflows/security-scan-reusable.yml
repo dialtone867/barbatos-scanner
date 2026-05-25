@@ -1,21 +1,13 @@
 name: BARBATOS Security Scan (Reusable)
 
-# Reusable workflow that can be called from any repository's CI pipeline.
-# This allows repos to sequence security scanning after their build/test jobs,
-# enabling coverage artifacts to be passed through for SonarQube analysis.
+# Reusable workflow called from any repository's CI pipeline.
 #
 # Usage (from caller):
 #   jobs:
-#     build:
-#       runs-on: self-hosted
-#       steps: ...  # build, test, upload coverage artifact
-#
 #     security-scan:
-#       needs: build
-#       uses: sketch0395/SRTM-tool/.github/workflows/security-scan-reusable.yml@main
+#       uses: dialtone867/barbatos-scanner/.github/workflows/security-scan-reusable.yml@main
 #       with:
-#         scan_mode: quick
-#         coverage_artifact: coverage-xml  # name of artifact from build job
+#         scan_mode: full
 #       secrets: inherit
 
 on:
@@ -43,11 +35,6 @@ on:
         type: string
       target_ref:
         description: 'Optional: Branch/tag/commit to scan (external scan mode)'
-        required: false
-        default: ''
-        type: string
-      coverage_artifact:
-        description: 'Name of coverage artifact from a prior job (downloaded via gh CLI)'
         required: false
         default: ''
         type: string
@@ -151,49 +138,12 @@ on:
         required: false
         default: true
         type: boolean
-      create_jira_tickets:
-        description: 'Disable JIRA ticket creation even when secrets are present (set to false to skip)'
-        required: false
-        default: true
-        type: boolean
-      jira_project_key:
-        description: 'JIRA project key to create tickets in (e.g. SEC, INFRA)'
-        required: false
-        default: ''
-        type: string
-      jira_issue_type:
-        description: 'JIRA issue type for created tickets'
-        required: false
-        default: 'Bug'
-        type: string
-      pr_base_branch:
-        description: 'Base branch to count merged PRs for the metrics chart (default: main)'
-        required: false
-        default: 'main'
-        type: string
-      write_metrics:
-        description: 'Write and upload a metrics row for this scan'
-        required: false
-        default: true
-        type: boolean
     secrets:
       OPENAI_API_KEY:
         description: 'OpenAI API key for Garak LLM security probing'
         required: false
       ANTHROPIC_API_KEY:
         description: 'Anthropic API key for Garak LLM security probing'
-        required: false
-      JIRA_BASE_URL:
-        description: 'Jira Cloud base URL (e.g. https://yourcompany.atlassian.net)'
-        required: false
-      JIRA_USER_EMAIL:
-        description: 'Email address associated with the Jira API token'
-        required: false
-      JIRA_API_TOKEN:
-        description: 'Jira Cloud personal API token'
-        required: false
-      JIRA_PROJECT_KEY:
-        description: 'Jira project key (e.g. SAP, SEC). Takes precedence over the jira_project_key input.'
         required: false
 
 permissions:
@@ -239,12 +189,6 @@ jobs:
       SKIP_ANCHORE: "${{ inputs.skip_anchore }}"
       SKIP_API_DISCOVERY: "${{ inputs.skip_api_discovery }}"
       CREATE_GITHUB_ISSUE: "${{ inputs.create_github_issue }}"
-      CREATE_JIRA_TICKETS: "${{ inputs.create_jira_tickets }}"  # true by default; set to false to disable
-      JIRA_PROJECT_KEY: "${{ secrets.JIRA_PROJECT_KEY || inputs.jira_project_key }}"
-      JIRA_ISSUE_TYPE: "${{ inputs.jira_issue_type }}"
-      JIRA_BASE_URL: "${{ secrets.JIRA_BASE_URL }}"
-      JIRA_USER_EMAIL: "${{ secrets.JIRA_USER_EMAIL }}"
-      JIRA_API_TOKEN: "${{ secrets.JIRA_API_TOKEN }}"
 
     steps:
       - name: Checkout Target Repository
@@ -297,82 +241,12 @@ jobs:
       - name: Checkout BARBATOS Security Scanner
         uses: actions/checkout@v5
         with:
-          repository: sketch0395/SRTM-tool
+          repository: dialtone867/barbatos-scanner
           path: barbatos
           fetch-depth: 1
 
-      - name: Download coverage artifact
-        if: inputs.coverage_artifact != ''
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          echo "📥 Downloading coverage artifact: ${{ inputs.coverage_artifact }}"
-          gh run download "$GITHUB_RUN_ID" \
-            --repo "$GITHUB_REPOSITORY" \
-            --name "${{ inputs.coverage_artifact }}" \
-            --dir target-repo \
-          && echo "✅ Coverage artifact downloaded" \
-          || echo "⚠️ Coverage artifact not available — SonarQube will run without coverage data"
-
-          # Rewrite absolute <source> paths in coverage.xml so SonarQube can
-          # map them to the checkout directory on this runner.
-          if [[ -f target-repo/coverage.xml ]]; then
-            CHECKOUT_DIR="${{ github.workspace }}/target-repo"
-            echo "🔧 Rewriting coverage.xml source paths → $CHECKOUT_DIR"
-            sed -i -E "s|<source>[^<]+</source>|<source>${CHECKOUT_DIR}</source>|g" target-repo/coverage.xml
-          fi
-
-      - name: Free Disk Space
-        run: |
-          echo "📊 Disk usage before cleanup:"
-          df -h /
-          # Remove large pre-installed toolchains not needed for security scanning
-          sudo rm -rf /usr/local/lib/android \
-                      /usr/local/share/boost \
-                      /usr/share/dotnet \
-                      /opt/ghc \
-                      /opt/hostedtoolcache/CodeQL \
-                      /usr/local/.ghcup \
-                      /usr/lib/jvm \
-                      /usr/share/swift \
-                      /usr/local/share/chromium \
-                      /usr/local/share/powershell \
-                      /usr/local/lib/node_modules \
-                      /var/lib/snapd 2>/dev/null || true
-          sudo apt-get clean
-          docker image prune -af --filter "until=1h" 2>/dev/null || true
-          echo "📊 Disk usage after cleanup:"
-          df -h /
-
       - name: Set up Docker
         uses: docker/setup-buildx-action@v3
-
-      - name: Cache Docker Images
-        uses: actions/cache@v5
-        with:
-          path: /tmp/.buildx-cache
-          key: ${{ runner.os }}-docker-${{ github.sha }}
-          restore-keys: |
-            ${{ runner.os }}-docker-
-
-      - name: Pull Security Tool Images
-        run: |
-          mkdir -p /tmp/.buildx-cache
-          # Pull images sequentially to avoid racing for disk space.
-          # dhi.io images require authentication — skip if not available.
-          for image in \
-            anchore/grype:latest \
-            ghcr.io/aquasecurity/trivy:latest \
-            trufflesecurity/trufflehog:latest \
-            anchore/syft:latest \
-            clamav/clamav:latest \
-            bridgecrew/checkov:latest \
-            noqcks/xeol:latest; do
-            echo "⏬ Pulling $image..."
-            docker pull "$image" || echo "⚠️  Failed to pull $image — will be pulled on demand or skipped"
-          done
-          echo "✅ Security tool images ready"
 
       - name: Install Dependencies
         run: |
@@ -447,23 +321,6 @@ jobs:
           echo "scan_id=$SCAN_NAME" >> $GITHUB_OUTPUT
           echo "🚀 Initialized scan: $SCAN_NAME"
 
-      - name: Free Disk Space (pre-scan)
-        if: always()
-        run: |
-          # Prune Docker resources that are no longer needed after image pull.
-          # This typically recovers 8-15 GB on ubuntu-latest before Layer 12
-          # (Garak) attempts to install torch + transformers (~2 GB unpacked).
-          echo "Disk before cleanup:"
-          df -h / | tail -1
-          docker image prune -af  2>/dev/null || true
-          docker container prune -f 2>/dev/null || true
-          docker volume prune -f  2>/dev/null || true
-          docker builder prune -af 2>/dev/null || true
-          # Clear pip wheel cache so large cached wheels don't consume space twice.
-          python3 -m pip cache purge 2>/dev/null || true
-          echo "Disk after cleanup:"
-          df -h / | tail -1
-
       - name: Run Security Layers (CI Orchestrator)
         id: run-scan
         continue-on-error: true
@@ -514,57 +371,6 @@ jobs:
           ls -la "$SCAN_DIR"/scan-manifest* "$SCAN_DIR"/manifest-summary* 2>&1 || echo "Manifest files not found before consolidation!"
           chmod +x scripts/shell/consolidate-security-reports.sh
           SCAN_DIR="$SCAN_DIR" TARGET_DIR="$TARGET_DIR" ./scripts/shell/consolidate-security-reports.sh || echo "Report generation completed with warnings"
-          echo "DEBUG: After consolidation, manifest files in consolidated-reports:"
-          ls -la "$SCAN_DIR/consolidated-reports"/scan-manifest* "$SCAN_DIR/consolidated-reports"/manifest-summary* 2>&1 || echo "Manifest files not found in consolidated-reports!"
-
-          # ─── Embed 90-day metrics trend into dashboard ────────────────────
-          DASHBOARD_FILE="$SCAN_DIR/consolidated-reports/dashboards/security-dashboard.html"
-          METRICS_90D_FILE="$SCAN_DIR/scan-metrics-90d.json"
-
-          if [ -f "$DASHBOARD_FILE" ]; then
-            echo "📈 Adding 90-day metrics trend to dashboard..."
-            echo "${GH_TOKEN}" | gh auth login --with-token >/dev/null 2>&1 || true
-            SINCE_DATE=$(date -u -d '90 days ago' +%Y-%m-%d 2>/dev/null || date -u -v-90d +%Y-%m-%d)
-            echo "Looking for scans since: $SINCE_DATE"
-
-            chmod +x scripts/shell/get-scan-metrics.sh scripts/shell/embed-metrics-in-dashboard.sh
-
-            # Collect metrics (without --quiet so we see what was found)
-            if ./scripts/shell/get-scan-metrics.sh \
-              --github-only \
-              --from-github "${{ github.repository }}" \
-              --since "$SINCE_DATE" \
-              --output "$METRICS_90D_FILE"; then
-              echo "✅ Metrics collected successfully"
-            else
-              echo "⚠️ Metrics aggregation completed with warnings (see above)"
-            fi
-
-            if [ -s "$METRICS_90D_FILE" ]; then
-              # Resolve base branch: use input override if set, otherwise auto-detect from repo API
-              PR_REPO="${{ inputs.repository_url || github.repository }}"
-              PR_REPO=$(echo "$PR_REPO" | sed 's|https://github.com/||; s|/$||')
-              OVERRIDE_BRANCH="${{ inputs.pr_base_branch }}"
-              if [ -n "$OVERRIDE_BRANCH" ]; then
-                PR_BASE_BRANCH="$OVERRIDE_BRANCH"
-              else
-                PR_BASE_BRANCH=$(gh api "repos/${PR_REPO}" --jq '.default_branch' 2>/dev/null || echo "main")
-              fi
-              echo "📊 Counting PRs merged to: ${PR_BASE_BRANCH} (repo: ${PR_REPO})"
-              ./scripts/shell/embed-metrics-in-dashboard.sh \
-                --metrics "$METRICS_90D_FILE" \
-                --dashboard "$DASHBOARD_FILE" \
-                --chart-type bar \
-                --max-points 90 \
-                --pr-repo "$PR_REPO" \
-                --pr-base-branch "$PR_BASE_BRANCH" \
-                --pr-since "$SINCE_DATE" \
-                || echo "⚠️ Dashboard metrics embedding completed with warnings"
-              echo "✅ Metrics embedding step completed"
-            else
-              echo "⚠️ No metrics data available for embedding"
-            fi
-          fi
 
       - name: Fix Artifact Permissions
         if: always()
@@ -626,63 +432,6 @@ jobs:
             cat "$SCAN_DIR/consolidated-reports/markdown-reports/executive-summary.md" >> $GITHUB_STEP_SUMMARY
           fi
 
-      - name: Write Metrics Row
-        if: always() && inputs.write_metrics != false && (inputs.scan_mode == 'nightly' || github.event_name == 'workflow_dispatch')
-        run: |
-          cd barbatos
-          SCAN_DIR="${{ steps.init-scan.outputs.scan_dir }}"
-          FINDINGS_JSON="$SCAN_DIR/security-findings-summary.json"
-
-          CRITICAL=0; HIGH=0; MEDIUM=0; LOW=0
-          HAS_FINDINGS=false
-          if [ -f "$FINDINGS_JSON" ]; then
-            HAS_FINDINGS=true
-            CRITICAL=$(jq -r '.summary.total_critical // 0' "$FINDINGS_JSON" 2>/dev/null || echo 0)
-            HIGH=$(jq -r     '.summary.total_high     // 0' "$FINDINGS_JSON" 2>/dev/null || echo 0)
-            MEDIUM=$(jq -r   '.summary.total_medium   // 0' "$FINDINGS_JSON" 2>/dev/null || echo 0)
-            LOW=$(jq -r      '.summary.total_low      // 0' "$FINDINGS_JSON" 2>/dev/null || echo 0)
-          fi
-
-          jq -cn \
-            --arg  scan_id        "${{ steps.init-scan.outputs.scan_id }}" \
-            --arg  target_name    "${{ inputs.repository_url || github.repository }}" \
-            --arg  scan_type      "${{ inputs.scan_mode }}" \
-            --arg  scan_user      "${{ github.actor }}" \
-            --arg  scan_timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            --arg  repository     "${{ github.repository }}" \
-            --arg  run_id         "${{ github.run_id }}" \
-            --arg  run_url        "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
-            --argjson critical    "$CRITICAL" \
-            --argjson high        "$HIGH" \
-            --argjson medium      "$MEDIUM" \
-            --argjson low         "$LOW" \
-            --argjson has_findings "$HAS_FINDINGS" \
-            '{
-              scan_id:             $scan_id,
-              target_name:         $target_name,
-              scan_type:           $scan_type,
-              scan_user:           $scan_user,
-              scan_timestamp:      $scan_timestamp,
-              repository:          $repository,
-              run_id:              $run_id,
-              run_url:             $run_url,
-              has_findings_summary:$has_findings,
-              critical:            $critical,
-              high:                $high,
-              medium:              $medium,
-              low:                 $low
-            }' > "$SCAN_DIR/scan-metrics.json"
-
-      - name: Enrich Findings with NVD + CISA KEV
-        if: always()
-        env:
-          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
-          SCAN_DIR: ${{ steps.init-scan.outputs.scan_dir }}
-        run: |
-          cd barbatos
-          chmod +x scripts/shell/enrich-findings.sh
-          scripts/shell/enrich-findings.sh || true
-
       - name: Upload Complete Scan Results
         uses: actions/upload-artifact@v5
         if: always()
@@ -690,15 +439,6 @@ jobs:
           name: ${{ steps.init-scan.outputs.scan_id }}
           path: barbatos/${{ steps.init-scan.outputs.scan_dir }}/
           retention-days: 30
-
-      - name: Upload Metrics Row
-        uses: actions/upload-artifact@v5
-        if: always() && inputs.write_metrics != false && (inputs.scan_mode == 'nightly' || github.event_name == 'workflow_dispatch')
-        with:
-          name: metrics-${{ steps.init-scan.outputs.scan_id }}
-          path: barbatos/${{ steps.init-scan.outputs.scan_dir }}/scan-metrics.json
-          if-no-files-found: warn
-          retention-days: 90
 
       - name: Check for Critical/High Vulnerabilities
         id: check-severity
@@ -1030,115 +770,6 @@ jobs:
             if (firstIssueNumber) {
               core.setOutput('issue_number', firstIssueNumber);
               core.setOutput('issue_url', firstIssueUrl);
-            }
-
-      - name: Create JIRA Tickets for Critical/High Findings
-        if: >
-          always() &&
-          (inputs.scan_mode == 'full' || inputs.scan_mode == 'nightly') &&
-          steps.check-severity.outputs.has_issues == 'true' &&
-          env.JIRA_BASE_URL != '' &&
-          env.JIRA_USER_EMAIL != '' &&
-          env.JIRA_API_TOKEN != '' &&
-          env.CREATE_JIRA_TICKETS != 'false'
-        shell: bash
-        env:
-          GITHUB_ISSUE_URL: ${{ steps.create-github-issue.outputs.issue_url }}
-          GITHUB_ISSUE_NUMBER: ${{ steps.create-github-issue.outputs.issue_number }}
-          FINDINGS_FILE: barbatos/${{ steps.init-scan.outputs.scan_dir }}/security-findings-filtered.json
-          FINDINGS_FILE_FALLBACK: barbatos/${{ steps.init-scan.outputs.scan_dir }}/security-findings-summary.json
-          JIRA_URL: ${{ env.JIRA_BASE_URL }}
-          PROJECT_KEY: ${{ env.JIRA_PROJECT_KEY }}
-          ISSUE_TYPE: ${{ env.JIRA_ISSUE_TYPE }}
-          REPO_NAME: ${{ github.repository }}
-          CRITICAL_COUNT: ${{ steps.check-severity.outputs.critical }}
-          HIGH_COUNT: ${{ steps.check-severity.outputs.high }}
-          MEDIUM_COUNT: ${{ steps.check-severity.outputs.medium }}
-          LOW_COUNT: ${{ steps.check-severity.outputs.low }}
-          GITHUB_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          # Prefer filtered findings (suppressed tools removed); fall back to full summary.
-          if [ ! -f "${FINDINGS_FILE}" ] && [ -f "${FINDINGS_FILE_FALLBACK}" ]; then
-            export FINDINGS_FILE="${FINDINGS_FILE_FALLBACK}"
-          fi
-          AUTH=$(echo -n "${JIRA_USER_EMAIL}:${JIRA_API_TOKEN}" | base64 -w0)
-          REPO_SLUG=$(echo "${REPO_NAME}" | tr '/' '-' | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')
-          TODAY=$(date -u +"%Y-%m-%d")
-          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          export AUTH REPO_SLUG TODAY RUN_URL ISSUE_TYPE
-          chmod +x barbatos/scripts/shell/create-jira-tickets.sh
-          ./barbatos/scripts/shell/create-jira-tickets.sh
-
-      - name: Link Jira Tickets to GitHub Issue
-        if: >
-          always() &&
-          (inputs.scan_mode == 'full' || inputs.scan_mode == 'nightly') &&
-          steps.create-github-issue.outputs.issue_number != '' &&
-          env.JIRA_BASE_URL != '' &&
-          env.JIRA_API_TOKEN != '' &&
-          env.CREATE_JIRA_TICKETS != 'false'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const issueNumber = parseInt('${{ steps.create-github-issue.outputs.issue_number }}');
-            if (!issueNumber) { console.log('No GitHub issue number — skipping Jira link comment'); return; }
-
-            const ticketsFile = '/tmp/jira_created_tickets.txt';
-            if (!fs.existsSync(ticketsFile)) {
-              console.log('No Jira tickets were created this run — skipping link comment');
-              return;
-            }
-
-            const lines = fs.readFileSync(ticketsFile, 'utf8').trim().split('\n').filter(Boolean);
-            if (!lines.length) { console.log('Jira tickets file is empty — skipping'); return; }
-
-            const jiraBaseUrl = '${{ env.JIRA_BASE_URL }}';
-            const ticketLinks = lines.map(line => {
-              const [key, url] = line.split('|');
-              return `- [${key}](${url})`;
-            }).join('\n');
-
-            const comment = [
-              '### 🎫 Jira Tickets Created',
-              '',
-              'The following Jira tickets were opened for these security findings:',
-              '',
-              ticketLinks,
-              '',
-              '_Each Jira ticket also carries a remote link back to this issue._',
-            ].join('\n');
-
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: issueNumber,
-              body: comment,
-            });
-            console.log(`Posted ${lines.length} Jira ticket link(s) to GitHub issue #${issueNumber}`);
-
-            // Update the GitHub issue title to include the JIRA key(s)
-            const keys = lines.map(line => line.split('|')[0]).filter(Boolean);
-            if (keys.length > 0) {
-              const currentIssue = await github.rest.issues.get({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: issueNumber,
-              });
-              const currentTitle = currentIssue.data.title;
-              const jiraPrefix = keys.join(', ');
-              // Only prepend if not already present
-              if (!currentTitle.startsWith(jiraPrefix)) {
-                const newTitle = `${jiraPrefix}: ${currentTitle}`;
-                await github.rest.issues.update({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  issue_number: issueNumber,
-                  title: newTitle,
-                });
-                console.log(`Updated issue #${issueNumber} title to: ${newTitle}`);
-              }
             }
 
       - name: Fail on Critical Vulnerabilities
