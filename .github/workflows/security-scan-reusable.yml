@@ -297,7 +297,7 @@ jobs:
       - name: Checkout BARBATOS Security Scanner
         uses: actions/checkout@v5
         with:
-          repository: sketch0395/barbatos-scanner
+          repository: sketch0395/SRTM-tool
           path: barbatos
           fetch-depth: 1
 

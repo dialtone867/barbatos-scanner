@@ -1,0 +1,842 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# security-scan × BARBATOS – GitHub Actions workflow template
+#
+# ── DO YOU NEED TO EDIT THIS FILE? ───────────────────────────────────────────
+#   NO — copy this file as-is.  Every value that varies (your BARBATOS URL,
+#   job ID, webhook secret) is injected automatically by BARBATOS at run-time
+#   as workflow inputs.  You do not need to hard-code anything here.
+#
+# ── ONE-TIME SETUP (2 steps) ─────────────────────────────────────────────────
+#
+#   STEP 1 — Add this file to your repository:
+#     Copy to:  .github/workflows/security-scan-barbatos.yml
+#     Commit and push to your default branch (main / master).
+#     GitHub Actions picks it up automatically.
+#
+#   STEP 2 — Create a GitHub Personal Access Token (PAT):
+#     BARBATOS needs a PAT to trigger the workflow on your behalf.
+#
+#     Option A  Fine-grained token (recommended — least privilege):
+#       https://github.com/settings/personal-access-tokens/new
+#       • Resource owner : the org or user that owns the target repo
+#       • Repository access : select the specific repo(s) to scan
+#       • Repository permissions to enable:
+#           Actions    → Read and Write   (to dispatch workflow_dispatch)
+#           Contents   → Read-only        (to read the workflow file)
+#       • Set an expiration you're comfortable with (90 days is sensible).
+#       Copy the generated token and paste it into the BARBATOS security-scan form.
+#
+#     Option B  Classic token (simpler, broader):
+#       https://github.com/settings/tokens/new
+#       • Check  repo  (full control of private repositories)
+#       • Check  workflow  (update GitHub Action workflows)
+#       Note: classic tokens grant broad access — use fine-grained when possible.
+#
+#   STEP 3 — (Optional) set a webhook secret for request validation:
+#     In your repository: Settings → Secrets and variables → Actions → New secret
+#     Name:   BARBATOS_WEBHOOK_SECRET
+#     Value:  any long random string (e.g. openssl rand -hex 32)
+#     Enter the same value in the BARBATOS security-scan → "Webhook Secret" field.
+#     If you skip this step, all scan callbacks are accepted without validation.
+#
+# ── THAT'S IT ─────────────────────────────────────────────────────────────────
+#   Return to BARBATOS, fill in Repo Owner, Repo Name, and your PAT,
+#   then click "Trigger security-scan Scan".  BARBATOS handles the rest.
+#
+# ── NOTE ─────────────────────────────────────────────────────────────────────
+#   Scanning scripts (Syft, Grype, Trivy, TruffleHog, Checkov, Xeol, etc.) are
+#   hosted in the public repo sketch0395/barbatos-scanner under scripts/shell/.
+#   No token or secret is needed to check out that repo.
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: security-scan BARBATOS Scan
+
+on:
+  workflow_dispatch:
+    inputs:
+      barbatos_callback_url:
+        description: 'BARBATOS webhook endpoint (https://your-host/api/security-scan-webhook)'
+        required: true
+      barbatos_job_id:
+        description: 'Job ID issued by BARBATOS /api/security-scan-trigger'
+        required: true
+      barbatos_webhook_secret:
+        description: 'Shared webhook secret (leave blank if not set)'
+        required: false
+      scan_mode:
+        description: 'Scan mode: quick (layers 1,2,7,8,9) or full (all layers)'
+        required: false
+        type: choice
+        options:
+          - full
+          - quick
+      expected_scans:
+        description: 'Number of tool payloads BARBATOS should expect (default: 9 for full, 5 for quick)'
+        required: false
+
+env:
+  CALLBACK:       ${{ inputs.barbatos_callback_url }}
+  JOB_ID:         ${{ inputs.barbatos_job_id }}
+  SECRET:         ${{ inputs.barbatos_webhook_secret || secrets.BARBATOS_WEBHOOK_SECRET || '' }}
+  SCAN_MODE:      ${{ inputs.scan_mode || 'full' }}
+  EXPECTED_SCANS: ${{ inputs.expected_scans || '9' }}
+
+jobs:
+  security-scan-scan:
+    name: security-scan Security Scan → BARBATOS
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      # ── 1. Checkout the repository being scanned ─────────────────────────────
+      - name: Checkout target repository
+        uses: actions/checkout@v4
+        with:
+          path: target-repo
+          fetch-depth: 0          # full history required for TruffleHog
+
+      - name: ☑ Setup – target repository checked out
+        continue-on-error: true
+        run: |
+          curl -s --connect-timeout 5 --max-time 10 \
+            -X POST "$CALLBACK" \
+            -H "Content-Type: application/json" \
+            -H "X-Barbatos-Job-Id: $JOB_ID" \z
+            -H "X-Barbatos-Secret: $SECRET" \
+            -d '{"progress": {"step": "checkout-repo", "label": "Target repository checked out"}}' || true
+
+      # ── 2. Checkout BARBATOS scan engine (public repo — no token required) ──────────────────
+      - name: Checkout BARBATOS scan engine
+        uses: actions/checkout@v4
+        with:
+          repository: sketch0395/barbatos-scanner
+          path: security-scan
+          fetch-depth: 1
+
+      - name: ☑ Setup – BARBATOS scan engine checked out
+        continue-on-error: true
+        run: |
+          curl -s --connect-timeout 5 --max-time 10 \
+            -X POST "$CALLBACK" \
+            -H "Content-Type: application/json" \
+            -H "X-Barbatos-Job-Id: $JOB_ID" \
+            -H "X-Barbatos-Secret: $SECRET" \
+            -d '{"progress": {"step": "checkout-security-scan", "label": "BARBATOS scan engine checked out"}}' || true
+
+      # ── 3. Infrastructure setup ───────────────────────────────────────────────────────────
+      - name: Set up Docker
+        uses: docker/setup-buildx-action@v3
+      - name: ☑ Setup – Docker build environment ready
+        continue-on-error: true
+        run: |
+          curl -s --connect-timeout 5 --max-time 10 \
+            -X POST "$CALLBACK" \
+            -H "Content-Type: application/json" \
+            -H "X-Barbatos-Job-Id: $JOB_ID" \
+            -H "X-Barbatos-Secret: $SECRET" \
+            -d '{"progress": {"step": "docker-setup", "label": "Docker build environment ready"}}' || true
+      - name: Cache Docker images
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-docker-${{ github.sha }}
+          restore-keys: ${{ runner.os }}-docker-
+
+      - name: Pull security tool images
+        run: |
+          docker pull anchore/grype:latest &
+          docker pull aquasec/trivy:latest &
+          docker pull trufflesecurity/trufflehog:latest &
+          docker pull anchore/syft:latest &
+          wait
+          echo "✅ Security tool images ready"
+          curl -s --connect-timeout 5 --max-time 10 \
+            -X POST "$CALLBACK" \
+            -H "Content-Type: application/json" \
+            -H "X-Barbatos-Job-Id: $JOB_ID" \
+            -H "X-Barbatos-Secret: $SECRET" \
+            -d '{"progress": {"step": "docker-pull", "label": "Security tool images pulled"}}' || true
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y jq python3 python3-pip bats
+          pip3 install pyyaml --quiet
+          curl -s --connect-timeout 5 --max-time 10 \
+            -X POST "$CALLBACK" \
+            -H "Content-Type: application/json" \
+            -H "X-Barbatos-Job-Id: $JOB_ID" \
+            -H "X-Barbatos-Secret: $SECRET" \
+            -d '{"progress": {"step": "deps", "label": "System dependencies installed"}}' || true
+
+      # ── 4. Initialise scan directory (security-scan convention) ───────────────────────
+      - name: Initialize scan
+        id: init-scan
+        env:
+          TARGET_NAME: ${{ github.event.repository.name }}
+          GITHUB_ACTOR: ${{ github.actor }}
+        run: |
+          cd security-scan
+          chmod +x scripts/shell/run-target-security-scan.sh
+
+          TARGET_DIR="${{ github.workspace }}/target-repo"
+          TIMESTAMP=$(date +%Y-%m-%d_%H-%M-%S)
+          SCAN_NAME="${TARGET_NAME}_${GITHUB_ACTOR}_${TIMESTAMP}"
+          SCAN_DIR="scans/${SCAN_NAME}"
+          mkdir -p "$SCAN_DIR"
+
+          # Write env file once; every subsequent step sources this
+          {
+            echo "TARGET_DIR=$TARGET_DIR"
+            echo "TARGET_NAME=$TARGET_NAME"
+            echo "SCAN_NAME=$SCAN_NAME"
+            echo "SCAN_DIR=$PWD/$SCAN_DIR"
+            echo "SCAN_MODE=$SCAN_MODE"
+          } > /tmp/security-scan-env
+
+          echo "scan_dir=$SCAN_DIR"   >> "$GITHUB_OUTPUT"
+          echo "scan_id=$SCAN_NAME"   >> "$GITHUB_OUTPUT"
+          echo "🚀 Scan initialised: $SCAN_NAME"
+          curl -s --connect-timeout 5 --max-time 10 \
+            -X POST "$CALLBACK" \
+            -H "Content-Type: application/json" \
+            -H "X-Barbatos-Job-Id: $JOB_ID" \
+            -H "X-Barbatos-Secret: $SECRET" \
+            -d "{\"progress\": {\"step\": \"scan-init\", \"label\": \"Environment ready \u2014 starting scan layers...\"}}" || true
+
+      # ── 5. security-scan scanning layers ──────────────────────────────────────────────
+
+      - name: Layer 1 – SBOM (Syft)
+        continue-on-error: true
+        run: |
+          source /tmp/security-scan-env && cd security-scan
+          chmod +x scripts/shell/run-complete-sbom-scan.sh
+          SCAN_DIR="$SCAN_DIR" TARGET_DIR="$TARGET_DIR" \
+            ./scripts/shell/run-complete-sbom-scan.sh \
+            || echo "⚠  Layer 1 (Syft SBOM): scan script exited with a non-zero code. This is usually harmless — Syft still writes partial results. Check the output above for details."
+
+          # ── Send Syft SBOM immediately so design-element auto-population starts early ──
+          # security-scan's run-complete-sbom-scan.sh calls run-sbom-scan.sh which uses
+          # init_scan_environment "sbom" → $SCAN_DIR/sbom/
+          # generate_sbom "filesystem" creates exactly: $SCAN_DIR/sbom/filesystem.json
+          SYFT_JSON=""
+          # Try the canonical path first (no find needed)
+          if [ -f "$SCAN_DIR/sbom/filesystem.json" ] && [ -s "$SCAN_DIR/sbom/filesystem.json" ]; then
+            SYFT_JSON="$SCAN_DIR/sbom/filesystem.json"
+          else
+            # Fallback: largest non-summary JSON in sbom dir
+            SYFT_JSON=$(find "$SCAN_DIR/sbom" -maxdepth 4 -name "*.json" \
+              -not -type d \
+              ! -name "*.sarif.json" ! -name "package-lock.json" ! -name "package.json" \
+              ! -name "*summary*" \
+              -printf '%s %p\n' 2>/dev/null | sort -rn | head -1 | awk '{print $2}')
+          fi
+          if [ -z "$SYFT_JSON" ]; then
+            # Broad fallback: scan the whole scan dir for any sbom/syft-like JSON
+            SYFT_JSON=$(find "$SCAN_DIR" -maxdepth 5 -name "*.json" \
+              -not -type d \
+              \( -path "*/sbom/*" -o -path "*/syft/*" -o -name "*sbom*" \) \
+              ! -name "*.sarif.json" \
+              -printf '%s %p\n' 2>/dev/null | sort -rn | head -1 | awk '{print $2}')
+          fi
+          if [ -n "$SYFT_JSON" ]; then
+            echo "📦 Sending Syft SBOM inline: $SYFT_JSON ($(wc -c < "$SYFT_JSON" 2>/dev/null || echo '?') bytes)"
+            # Syft runs as Docker root — make the file readable before jq tries to load it
+            sudo chmod a+r "$SYFT_JSON" 2>/dev/null || true
+            if jq -n --arg tool "syft" --slurpfile content "$SYFT_JSON" \
+              '{"tool": $tool, "content": $content[0]}' > /tmp/bbsbom.json 2>/tmp/bbsbom-jq-err; then
+              SBOM_HTTP=$(curl -s -o /tmp/bbsbom-resp.json -w "%{http_code}" \
+                --connect-timeout 15 --max-time 60 \
+                -X POST "$CALLBACK" \
+                -H "Content-Type: application/json" \
+                -H "X-Barbatos-Job-Id: $JOB_ID" \
+                -H "X-Barbatos-Secret: $SECRET" \
+                --data-binary @/tmp/bbsbom.json 2>/dev/null || echo "000")
+              echo "  ↳ inline SBOM HTTP $SBOM_HTTP — $(cat /tmp/bbsbom-resp.json 2>/dev/null | head -c 200)"
+            else
+              echo "⚠  Layer 1: jq failed building SBOM payload: $(cat /tmp/bbsbom-jq-err)"
+            fi
+          else
+            echo "⚠  Layer 1: no SBOM JSON found under $SCAN_DIR/sbom/ — Syft may have failed."
+            echo "    Contents of $SCAN_DIR/sbom/ (if it exists):"
+            ls -la "$SCAN_DIR/sbom/" 2>/dev/null || echo "    (sbom dir does not exist)"
+            echo "    All JSON files under $SCAN_DIR (depth 5):"
+            find "$SCAN_DIR" -maxdepth 5 -name "*.json" -not -type d 2>/dev/null | head -20 || echo "    (none found)"
+          fi
+
+          curl -s --connect-timeout 10 --max-time 15 \
+            -X POST "$CALLBACK" \
+            -H "Content-Type: application/json" \
+            -H "X-Barbatos-Job-Id: $JOB_ID" \
+            -H "X-Barbatos-Secret: $SECRET" \
+            -d '{"progress": {"layer": 1, "name": "sbom", "total": 11}}' || true
+
+      - name: "\U0001F50D Debug – SBOM layer output"
+        if: always()
+        continue-on-error: true
+        run: |
+          source /tmp/security-scan-env
+          echo "=== SBOM scan directory: $SCAN_DIR/sbom ==="
+          if [ -d "$SCAN_DIR/sbom" ]; then
+            find "$SCAN_DIR/sbom" -maxdepth 5 -printf "%M %10s  %p\n" 2>/dev/null | sort
+          else
+            echo "  ⚠ $SCAN_DIR/sbom does NOT exist"
+          fi
+          echo "=== All *.json files under $SCAN_DIR (depth 6) ==="
+          find "$SCAN_DIR" -maxdepth 6 -name "*.json" -not -type d \
+            -printf "%10s  %p\n" 2>/dev/null | sort -rn | head -30 || echo "  (none)"
+
+      - name: Layer 2 – Secret detection (TruffleHog)
+        continue-on-error: true
+        run: |
+          source /tmp/security-scan-env && cd security-scan
+          chmod +x scripts/shell/run-trufflehog-scan.sh
+          SCAN_DIR="$SCAN_DIR" TARGET_DIR="$TARGET_DIR" \
+            ./scripts/shell/run-trufflehog-scan.sh filesystem \
+            || echo "⚠  Layer 2 (TruffleHog): scan script exited with a non-zero code. TruffleHog exits 183 when secrets are found — this is expected behaviour, not a failure."
+          curl -s --connect-timeout 10 --max-time 15 \
+            -X POST "$CALLBACK" \
+            -H "Content-Type: application/json" \
+            -H "X-Barbatos-Job-Id: $JOB_ID" \
+            -H "X-Barbatos-Secret: $SECRET" \
+            -d '{"progress": {"layer": 2, "name": "secrets", "total": 11}}' || true
+
+      - name: Layer 3 – Code quality (SonarQube) [full only]
+        if: env.SCAN_MODE != 'quick'
+        continue-on-error: true
+        run: |
+          source /tmp/security-scan-env && cd security-scan
+          chmod +x scripts/shell/run-sonar-analysis.sh
+          SCAN_DIR="$SCAN_DIR" TARGET_DIR="$TARGET_DIR" \
+            ./scripts/shell/run-sonar-analysis.sh \
+            || echo "⚠  Layer 3 (SonarQube): analysis script exited non-zero. SonarQube requires a running server — if none is configured this layer is safely skipped."
+          curl -s --connect-timeout 10 --max-time 15 \
+            -X POST "$CALLBACK" \
+            -H "Content-Type: application/json" \
+            -H "X-Barbatos-Job-Id: $JOB_ID" \
+            -H "X-Barbatos-Secret: $SECRET" \
+            -d '{"progress": {"layer": 3, "name": "code-quality", "total": 11}}' || true
+
+      - name: Layer 4 – Malware detection (ClamAV) [full only]
+        if: env.SCAN_MODE != 'quick'
+        continue-on-error: true
+        run: |
+          source /tmp/security-scan-env && cd security-scan
+          chmod +x scripts/shell/run-clamav-scan.sh
+          SCAN_DIR="$SCAN_DIR" TARGET_DIR="$TARGET_DIR" \
+            ./scripts/shell/run-clamav-scan.sh \
+            || echo "⚠  Layer 4 (ClamAV): scan script exited non-zero. ClamAV exits non-zero when threats are detected — check the scan output above to see what was found."
+          curl -s --connect-timeout 10 --max-time 15 \
+            -X POST "$CALLBACK" \
+            -H "Content-Type: application/json" \
+            -H "X-Barbatos-Job-Id: $JOB_ID" \
+            -H "X-Barbatos-Secret: $SECRET" \
+            -d '{"progress": {"layer": 4, "name": "malware", "total": 11}}' || true
+
+      - name: Layer 5 – Helm chart build [full only]
+        if: env.SCAN_MODE != 'quick'
+        continue-on-error: true
+        run: |
+          source /tmp/security-scan-env && cd security-scan
+          chmod +x scripts/shell/run-helm-build.sh
+          SCAN_DIR="$SCAN_DIR" TARGET_DIR="$TARGET_DIR" \
+            ./scripts/shell/run-helm-build.sh \
+            || echo "⚠  Layer 5 (Helm): build script exited non-zero. If your repo has no Helm charts this layer is safely skipped. Otherwise check the output above for chart errors."
+          curl -s --connect-timeout 10 --max-time 15 \
+            -X POST "$CALLBACK" \
+            -H "Content-Type: application/json" \
+            -H "X-Barbatos-Job-Id: $JOB_ID" \
+            -H "X-Barbatos-Secret: $SECRET" \
+            -d '{"progress": {"layer": 5, "name": "helm", "total": 11}}' || true
+
+      - name: Layer 6 – IaC security (Checkov) [full only]
+        if: env.SCAN_MODE != 'quick'
+        continue-on-error: true
+        env:
+          CI: true
+        run: |
+          source /tmp/security-scan-env && cd security-scan
+          chmod +x scripts/shell/run-checkov-scan.sh
+          SCAN_DIR="$SCAN_DIR" TARGET_DIR="$TARGET_DIR" \
+            ./scripts/shell/run-checkov-scan.sh \
+            || echo "⚠  Layer 6 (Checkov): scan script exited non-zero. Checkov exits 1 when policy violations are found — this is expected. Results are still captured and sent to BARBATOS."
+          curl -s --connect-timeout 10 --max-time 15 \
+            -X POST "$CALLBACK" \
+            -H "Content-Type: application/json" \
+            -H "X-Barbatos-Job-Id: $JOB_ID" \
+            -H "X-Barbatos-Secret: $SECRET" \
+            -d '{"progress": {"layer": 6, "name": "iac", "total": 11}}' || true
+
+      - name: "\U0001F50D Debug – Checkov layer output"
+        if: always()
+        continue-on-error: true
+        run: |
+          source /tmp/security-scan-env
+          echo "=== Checkov scan directory: $SCAN_DIR/checkov ==="
+          if [ -d "$SCAN_DIR/checkov" ]; then
+            find "$SCAN_DIR/checkov" -maxdepth 6 -printf "%M %10s  %p\n" 2>/dev/null | sort
+          else
+            echo "  ⚠ $SCAN_DIR/checkov does NOT exist"
+          fi
+          echo "=== First 50 lines of any results JSON found ==="
+          _cf=$(find "$SCAN_DIR/checkov" -maxdepth 6 -type f \
+            \( -name "*checkov*results.json" -o -name "results_json.json" \) \
+            2>/dev/null | head -1)
+          if [ -n "$_cf" ]; then
+            echo "  File: $_cf"
+            head -50 "$_cf"
+          else
+            echo "  (no checkov results JSON found)"
+          fi
+
+      - name: Layer 7 – Container security (Trivy)
+        continue-on-error: true
+        run: |
+          source /tmp/security-scan-env && cd security-scan
+          chmod +x scripts/shell/run-trivy-scan.sh
+          SCAN_DIR="$SCAN_DIR" TARGET_DIR="$TARGET_DIR" \
+            ./scripts/shell/run-trivy-scan.sh filesystem \
+            || echo "⚠  Layer 7 (Trivy filesystem): scan exited non-zero — vulnerabilities may have been found or a scan error occurred. Check output above."
+          SCAN_DIR="$SCAN_DIR" TARGET_DIR="$TARGET_DIR" \
+            ./scripts/shell/run-trivy-scan.sh base \
+            || echo "⚠  Layer 7 (Trivy base image): scan exited non-zero. If your repo has no Dockerfile this is expected and safely skipped."
+          curl -s --connect-timeout 10 --max-time 15 \
+            -X POST "$CALLBACK" \
+            -H "Content-Type: application/json" \
+            -H "X-Barbatos-Job-Id: $JOB_ID" \
+            -H "X-Barbatos-Secret: $SECRET" \
+            -d '{"progress": {"layer": 7, "name": "trivy", "total": 11}}' || true
+
+      - name: Layer 8 – Vulnerability detection (Grype)
+        continue-on-error: true
+        run: |
+          source /tmp/security-scan-env && cd security-scan
+          chmod +x scripts/shell/run-grype-scan.sh
+          SCAN_DIR="$SCAN_DIR" TARGET_DIR="$TARGET_DIR" \
+            ./scripts/shell/run-grype-scan.sh sbom \
+            || echo "⚠  Layer 8 (Grype SBOM): scan exited non-zero — vulnerabilities may have been found or the SBOM was not generated in Layer 1. Check output above."
+          SCAN_DIR="$SCAN_DIR" TARGET_DIR="$TARGET_DIR" \
+            ./scripts/shell/run-grype-scan.sh images \
+            || echo "⚠  Layer 8 (Grype images): scan exited non-zero. If your repo has no container images this is expected and safely skipped."
+          curl -s --connect-timeout 10 --max-time 15 \
+            -X POST "$CALLBACK" \
+            -H "Content-Type: application/json" \
+            -H "X-Barbatos-Job-Id: $JOB_ID" \
+            -H "X-Barbatos-Secret: $SECRET" \
+            -d '{"progress": {"layer": 8, "name": "grype", "total": 11}}' || true
+
+      - name: Layer 9 – End-of-life detection (Xeol)
+        continue-on-error: true
+        run: |
+          source /tmp/security-scan-env && cd security-scan
+          chmod +x scripts/shell/run-xeol-scan.sh
+          SCAN_DIR="$SCAN_DIR" TARGET_DIR="$TARGET_DIR" \
+            ./scripts/shell/run-xeol-scan.sh \
+            || echo "⚠  Layer 9 (Xeol): scan exited non-zero. Xeol exits 1 when end-of-life packages are found — results are still captured."
+          curl -s --connect-timeout 10 --max-time 15 \
+            -X POST "$CALLBACK" \
+            -H "Content-Type: application/json" \
+            -H "X-Barbatos-Job-Id: $JOB_ID" \
+            -H "X-Barbatos-Secret: $SECRET" \
+            -d '{"progress": {"layer": 9, "name": "xeol", "total": 11}}' || true
+
+      - name: Layer 10 – Anchore security analysis [full only]
+        if: env.SCAN_MODE != 'quick'
+        continue-on-error: true
+        run: |
+          source /tmp/security-scan-env && cd security-scan
+          chmod +x scripts/shell/run-anchore-scan.sh
+          SCAN_DIR="$SCAN_DIR" TARGET_DIR="$TARGET_DIR" \
+            ./scripts/shell/run-anchore-scan.sh \
+            || echo "⚠  Layer 10 (Anchore): scan script exited non-zero. Anchore requires a running Anchore Engine service — if none is configured this layer is safely skipped."
+          curl -s --connect-timeout 10 --max-time 15 \
+            -X POST "$CALLBACK" \
+            -H "Content-Type: application/json" \
+            -H "X-Barbatos-Job-Id: $JOB_ID" \
+            -H "X-Barbatos-Secret: $SECRET" \
+            -d '{"progress": {"layer": 10, "name": "anchore", "total": 11}}' || true
+
+      - name: Layer 11 – API discovery
+        # Discovers REST endpoints, OpenAPI specs, and gRPC/GraphQL schemas
+        # from source code. Results populate the API section of BARBATOS.
+        continue-on-error: true
+        run: |
+          source /tmp/security-scan-env && cd security-scan
+          chmod +x scripts/shell/run-api-discovery.sh
+          SCAN_DIR="$SCAN_DIR" TARGET_DIR="$TARGET_DIR" \
+            ./scripts/shell/run-api-discovery.sh \
+            || echo "⚠  Layer 11 (API Discovery): script exited non-zero. If no API spec files (OpenAPI, routes, etc.) were found in the repo, this is expected and safely skipped."
+          curl -s --connect-timeout 10 --max-time 15 \
+            -X POST "$CALLBACK" \
+            -H "Content-Type: application/json" \
+            -H "X-Barbatos-Job-Id: $JOB_ID" \
+            -H "X-Barbatos-Secret: $SECRET" \
+            -d '{"progress": {"layer": 11, "name": "api-discovery", "total": 11}}' || true
+
+      # ── 6. Generate reports, dashboard, and findings summary ─────────────────
+      - name: Generate scan manifest
+        if: always()
+        continue-on-error: true
+        run: |
+          source /tmp/security-scan-env && cd security-scan
+          chmod +x scripts/shell/generate-scan-manifest.sh
+          SCAN_DIR="$SCAN_DIR" TARGET_DIR="$TARGET_DIR" \
+            ./scripts/shell/generate-scan-manifest.sh "$SCAN_DIR" || true
+          curl -s --connect-timeout 5 --max-time 10 \
+            -X POST "$CALLBACK" \
+            -H "Content-Type: application/json" \
+            -H "X-Barbatos-Job-Id: $JOB_ID" \
+            -H "X-Barbatos-Secret: $SECRET" \
+            -d '{"progress": {"step": "manifest", "label": "Scan manifest generated"}}' || true
+
+      - name: Consolidate reports and generate interactive dashboard
+        if: always()
+        continue-on-error: true
+        run: |
+          source /tmp/security-scan-env && cd security-scan
+          chmod +x scripts/shell/consolidate-security-reports.sh \
+                   scripts/shell/generate-security-dashboard.sh
+          # consolidate-security-reports.sh internally calls generate-security-dashboard.sh
+          # and produces: consolidated-reports/dashboards/security-dashboard.html
+          #               consolidated-reports/html-reports/{tool}/
+          #               consolidated-reports/markdown-reports/
+          #               consolidated-reports/csv-reports/
+          #               consolidated-reports/raw-data/
+          SCAN_DIR="$SCAN_DIR" TARGET_DIR="$TARGET_DIR" \
+            ./scripts/shell/consolidate-security-reports.sh \
+            || echo "⚠  Report consolidation exited non-zero — some tool outputs may be missing or malformed. Partial results will still be uploaded as artifacts."
+
+          if [ -f "$SCAN_DIR/consolidated-reports/dashboards/security-dashboard.html" ]; then
+            echo "✅ Interactive dashboard generated: $SCAN_DIR/consolidated-reports/dashboards/security-dashboard.html"
+          else
+            echo "⚠  Dashboard HTML not found. Consolidation may have failed or produced no findings. Check the 'Consolidate reports' step output above."
+          fi
+          curl -s --connect-timeout 5 --max-time 10 \
+            -X POST "$CALLBACK" \
+            -H "Content-Type: application/json" \
+            -H "X-Barbatos-Job-Id: $JOB_ID" \
+            -H "X-Barbatos-Secret: $SECRET" \
+            -d '{"progress": {"step": "reports", "label": "Reports consolidated, sending findings..."}}' || true
+
+      # ── 7. POST results to BARBATOS ────────────────────────────────────────────
+      - name: Diagnose – list scan output files
+        if: always()
+        continue-on-error: true
+        run: |
+          source /tmp/security-scan-env
+          echo "=== Scan directory: $SCAN_DIR ==="
+          # List every JSON/log file with its size so we know exactly what security-scan wrote
+          find "$SCAN_DIR" -maxdepth 5 \( -name "*.json" -o -name "*.log" \) \
+            -printf '%s\t%p\n' 2>/dev/null | sort -k2 | column -t || \
+          find "$SCAN_DIR" -type f | sort || \
+          echo "(find failed — scan dir may not exist)"
+
+      - name: Make scan outputs readable by runner
+        if: always()
+        continue-on-error: true
+        run: |
+          source /tmp/security-scan-env
+          # Docker-based scanners (Syft, Grype, Trivy, ClamAV, Checkov) run as root
+          # and write files with root ownership. The runner user can't read them with
+          # jq/curl unless we chmod them first. This is a non-destructive read-only grant.
+          sudo chmod -R a+r "$SCAN_DIR" 2>/dev/null || true
+          echo "✅ Scan outputs made world-readable"
+
+      - name: Send results to BARBATOS
+        if: always()
+        run: |
+          source /tmp/security-scan-env
+          # Notify that we are about to push findings
+          curl -s --connect-timeout 5 --max-time 10 \
+            -X POST "$CALLBACK" \
+            -H "Content-Type: application/json" \
+            -H "X-Barbatos-Job-Id: $JOB_ID" \
+            -H "X-Barbatos-Secret: $SECRET" \
+            -d '{"progress": {"step": "sending", "label": "Uploading findings to BARBATOS..."}}' || true
+          # ── Helper: POST one JSON file to the webhook ────────────────────────
+          send_scan() {
+            local TOOL="$1"
+            local FILE="$2"
+
+            if [ ! -f "$FILE" ]; then
+              echo "⚠  $TOOL: output file not found at '$FILE' — this tool may have been skipped or produced no output. Results will not be sent to BARBATOS for this tool."
+              return
+            fi
+
+            jq -n --arg tool "$TOOL" --slurpfile content "$FILE" \
+              '{"tool": $tool, "content": $content[0]}' > /tmp/bbpayload.json 2>/dev/null \
+              || { echo "⚠  $TOOL: failed to build JSON payload (jq error). The output file may be malformed or empty. Check the scan step above for errors."; return; }
+
+            HTTP=$(curl -s -o /tmp/bbresp.json -w "%{http_code}" \
+              --connect-timeout 15 --max-time 60 \
+              -X POST "$CALLBACK" \
+              -H "Content-Type: application/json" \
+              -H "X-Barbatos-Job-Id: $JOB_ID" \
+              -H "X-Barbatos-Secret: $SECRET" \
+              --data-binary @/tmp/bbpayload.json 2>/dev/null \
+              || echo "000")
+
+            if [ "$HTTP" -ge 200 ] && [ "$HTTP" -lt 300 ]; then
+              echo "✅ $TOOL → BARBATOS (HTTP $HTTP)"
+            elif [ "$HTTP" = "000" ]; then
+              echo "⚠  $TOOL: could not reach BARBATOS (no response / connection refused). Check that the callback URL '$CALLBACK' is correct and publicly reachable from GitHub Actions. Results saved in artifacts."
+            elif [ "$HTTP" = "401" ] || [ "$HTTP" = "403" ]; then
+              echo "⚠  $TOOL: BARBATOS rejected the request (HTTP $HTTP — authentication failure). Verify that your webhook secret in BARBATOS matches the BARBATOS_WEBHOOK_SECRET repo secret. Results saved in artifacts."
+            elif [ "$HTTP" = "404" ]; then
+              echo "⚠  $TOOL: BARBATOS returned 404 — job '$JOB_ID' was not found. The BARBATOS server may have restarted and lost its in-memory job store. Results saved in artifacts; re-trigger the scan to retry."
+            elif [ "$HTTP" -ge 500 ]; then
+              echo "⚠  $TOOL: BARBATOS returned a server error (HTTP $HTTP). Check the BARBATOS application logs for details. Results saved in artifacts."
+            else
+              echo "⚠  $TOOL: unexpected HTTP $HTTP from BARBATOS. Results saved in artifacts."
+            fi
+            echo "  ↳ response body: $(cat /tmp/bbresp.json 2>/dev/null | head -c 300)"
+          }
+
+          # ── Helper: find primary JSON file in a scan subdirectory ────────────
+          find_tool_json() {
+            local DIR="$1"
+            # Prefer the largest non-sarif REGULAR FILE (not directory).
+            # -not -type d excludes directories named *.json (e.g. Checkov Docker output
+            # creates checkov-results.json/ as a directory, not a file).
+            # Symlinks (-type l) are included since security-scan creates "current" symlinks.
+            # maxdepth 4 handles security-scan scripts that nest output in subdirectories.
+            find "$DIR" -maxdepth 4 -name "*.json" \
+              -not -type d \
+              ! -name "*.sarif.json" \
+              -printf '%s %p\n' 2>/dev/null \
+              | sort -rn | head -1 | awk '{print $2}'
+          }
+
+          # ── Helper: find Checkov result JSON specifically ─────────────────────
+          # Checkov Docker creates checkov-results.json as a DIRECTORY containing
+          # results_json.json. security-scan tries to mv results_json.json out of it; if
+          # permissions fail, the directory remains. This finder matches both the
+          # moved/merged file and the inner fallback — same as security-scan's own
+          # check-severity-gate.sh pattern.
+          find_checkov_json() {
+            local DIR="$1"
+            find "$DIR" -maxdepth 4 -type f \
+              \( -name "*checkov*results.json" -o -name "results_json.json" \) \
+              ! -name "*.sarif.json" \
+              -printf '%s %p\n' 2>/dev/null \
+              | sort -rn | head -1 | awk '{print $2}'
+          }
+
+          # ── Send each tool's primary output ─────────────────────────────────
+          # Note: syft was already sent inline after Layer 1; skipping here to avoid
+          # double-counting sbom-component findings. xeol, clamav, anchore still batch-sent.
+          for TOOL in grype trivy trufflehog xeol anchore; do
+            TOOL_DIR="$SCAN_DIR/$TOOL"
+            FILE=$(find_tool_json "$TOOL_DIR")
+            if [ -n "$FILE" ]; then
+              send_scan "$TOOL" "$FILE"
+            else
+              echo "ℹ  $TOOL: no output directory found (skipped or layer not run)"
+            fi
+          done
+
+          # ── Checkov: dedicated finder handles Docker directory-as-file issue ───
+          # security-scan's Checkov Docker step creates checkov-results.json/ as a DIRECTORY
+          # (not a file) containing results_json.json. security-scan moves it to the timestamped
+          # file, but the move can fail silently on permission errors. find_checkov_json
+          # uses -type f and matches both the merged file AND inner results_json.json.
+          echo "--- Checkov finder diagnostics ---"
+          echo "  checkov dir exists: $([ -d "$SCAN_DIR/checkov" ] && echo YES || echo NO)"
+          echo "  All files in checkov dir:"
+          find "$SCAN_DIR/checkov" -maxdepth 6 -printf "%M %10s  %p\n" 2>/dev/null | head -30 || echo "  (dir missing)"
+          CHECKOV_FILE=$(find_checkov_json "$SCAN_DIR/checkov")
+          echo "  find_checkov_json result: '${CHECKOV_FILE}'"
+          if [ -n "$CHECKOV_FILE" ]; then
+            send_scan "checkov" "$CHECKOV_FILE"
+          else
+            echo "⚠  checkov: no results JSON found — trying broader search"
+            CHECKOV_FILE_BROAD=$(find "$SCAN_DIR/checkov" -maxdepth 6 -type f -name "*.json" \
+              ! -name "*.sarif.json" -printf '%s %p\n' 2>/dev/null | sort -rn | head -1 | awk '{print $2}')
+            if [ -n "$CHECKOV_FILE_BROAD" ]; then
+              echo "  Broad fallback found: $CHECKOV_FILE_BROAD"
+              send_scan "checkov" "$CHECKOV_FILE_BROAD"
+            else
+              echo "ℹ  checkov: no output found (skipped or layer not run)"
+            fi
+          fi
+
+          # ── ClamAV: JSON preferred; fall back to converting text scan log ────────
+          CLAMAV_DIR="$SCAN_DIR/clamav"
+          CLAMAV_JSON=$(find_tool_json "$CLAMAV_DIR")
+          if [ -n "$CLAMAV_JSON" ]; then
+            send_scan "clamav" "$CLAMAV_JSON"
+          else
+            # ClamAV may write a text log instead of JSON; convert infections to JSON.
+            # run-clamav-scan.sh writes clamav-detailed.log; scan-directory-template
+            # sets SCAN_LOG=$SCAN_DIR/clamav/scan.log. Prefer detailed log over scan.log.
+            CLAMAV_LOG=$(find "$CLAMAV_DIR" -maxdepth 4 \
+              \( -name "clamav-detailed.log" -o -name "*.log" -o -name "*.txt" \) \
+              2>/dev/null | sort | head -1)
+            if [ -n "$CLAMAV_LOG" ]; then
+              echo "📋 ClamAV: no JSON found — converting scan log: $CLAMAV_LOG"
+              # Extract lines like: /path/to/file: VirusName FOUND
+              INFECTIONS=$(grep -E ' FOUND$' "$CLAMAV_LOG" 2>/dev/null \
+                | while IFS= read -r line; do
+                    FILE_PATH=$(echo "$line" | sed 's/: .* FOUND$//')
+                    VIRUS=$(echo "$line" | sed 's/^.*: //' | sed 's/ FOUND$//')
+                    printf '{"file":"%s","virus":"%s"},' \
+                      "$(echo "$FILE_PATH" | sed 's/"/\\"/g')" \
+                      "$(echo "$VIRUS"     | sed 's/"/\\"/g')"
+                  done | sed 's/,$//')
+              INFECTED_COUNT=$(grep -c ' FOUND$' "$CLAMAV_LOG" 2>/dev/null || echo 0)
+              SCANNED_COUNT=$(grep -oP 'Scanned files: \K[0-9]+' "$CLAMAV_LOG" 2>/dev/null || echo 0)
+              jq -n \
+                --argjson infected "$INFECTED_COUNT" \
+                --argjson scanned "$SCANNED_COUNT" \
+                --argjson infections "[${INFECTIONS}]" \
+                '{"ScannedFiles": $scanned, "InfectedFiles": $infected, "Infections": $infections}' \
+                > /tmp/clamav-converted.json 2>/dev/null && \
+              send_scan "clamav" "/tmp/clamav-converted.json" || \
+              echo "⚠  clamav: log found but conversion failed — check log format"
+            else
+              echo "ℹ  clamav: no output found (layer may have been skipped or ClamAV not installed)"
+            fi
+          fi
+
+          # ── Send structured SBOM inventory ───────────────────────────────────
+          # security-scan writes SBOM to $SCAN_DIR/sbom/ (init_scan_environment "sbom").
+          # run-sbom-scan.sh canonically generates $SCAN_DIR/sbom/filesystem.json
+          # (generate_sbom "filesystem" → $OUTPUT_DIR/filesystem.json).
+          # Sent as 'syft' so BARBATOS appends findings even if the inline
+          # Layer-1 send failed.  The sbomProcessed dedup flag prevents
+          # double-counting when the inline send already succeeded.
+          SBOM_JSON=""
+          # Priority list matches security-scan export-sbom.sh lookup order
+          for _sf in \
+              "$SCAN_DIR/sbom/filesystem.json" \
+              "$SCAN_DIR/sbom/sbom.json" \
+              "$SCAN_DIR/sbom/sbom.spdx.json" \
+              "$SCAN_DIR/sbom/sbom.cyclonedx.json"; do
+            if [ -f "$_sf" ] && [ -s "$_sf" ]; then
+              SBOM_JSON="$_sf"
+              break
+            fi
+          done
+          if [ -z "$SBOM_JSON" ]; then
+            # Fallback: largest non-summary JSON in sbom dir
+            SBOM_JSON=$(find "$SCAN_DIR/sbom" -maxdepth 4 \
+              -name "*.json" -not -type d \
+              ! -name "*.sarif.json" ! -name "*summary*" ! -name "package*.json" \
+              -printf '%s %p\n' 2>/dev/null | sort -rn | head -1 | awk '{print $2}')
+          fi
+          if [ -z "$SBOM_JSON" ]; then
+            # Broad fallback: any sbom-related JSON in the scan dir
+            SBOM_JSON=$(find "$SCAN_DIR" -maxdepth 5 \
+              -name "*.json" -not -type d \
+              \( -path "*/sbom/*" -o -path "*/syft/*" -o -name "*sbom*" \) \
+              ! -name "*.sarif.json" ! -name "*summary*" \
+              -printf '%s %p\n' 2>/dev/null | sort -rn | head -1 | awk '{print $2}')
+          fi
+          echo "--- SBOM finder diagnostics ---"
+          echo "  sbom dir exists: $([ -d "$SCAN_DIR/sbom" ] && echo YES || echo NO)"
+          echo "  All files in sbom dir:"
+          find "$SCAN_DIR/sbom" -maxdepth 5 -printf "%M %10s  %p\n" 2>/dev/null | head -20 || echo "  (dir missing)"
+          if [ -n "$SBOM_JSON" ]; then
+            echo "📦 Sending SBOM inventory: $SBOM_JSON ($(wc -c < "$SBOM_JSON") bytes)"
+            echo "  First 5 keys: $(head -c 500 "$SBOM_JSON" | tr -d '\n')"
+            # Send as 'syft' (not 'syft-summary') so findings are appended even if
+            # the inline Layer-1 send failed.  The sbomProcessed dedup flag in
+            # BARBATOS prevents double-counting when the inline send succeeded.
+            send_scan 'syft' "$SBOM_JSON"
+          else
+            echo "⚠  sbom: no SBOM JSON found at any expected path"
+            echo "  Broad fallback — any JSON under $SCAN_DIR (depth 6):"
+            find "$SCAN_DIR" -maxdepth 6 -name "*.json" -not -type d \
+              -printf '%s\t%p\n' 2>/dev/null | sort -rn | head -15
+          fi
+
+          # ── Send API discovery data ──────────────────────────────────────────────
+          # run-api-discovery.sh (line 720): OUTPUT_DIR="${SCAN_DIR}/api"
+          # OUTPUT_FILE="api-discovery.json" — canonical path is always
+          # $SCAN_DIR/api/api-discovery.json (one structured file, not a directory).
+          # Structure: { discovery_methods:{ code_routes:{python:[],nodejs:[],java:[]},
+          #              openapi_specs:[], graphql_schemas:[] }, summary:{...} }
+          # BARBATOS parseApiDiscovery() handles this structure natively — no
+          # pre-processing needed; just send the file directly.
+          API_FILE=""
+          if [ -f "$SCAN_DIR/api/api-discovery.json" ] && [ -s "$SCAN_DIR/api/api-discovery.json" ]; then
+            API_FILE="$SCAN_DIR/api/api-discovery.json"
+          else
+            # Fallback: search for the file in any api* subdirectory
+            for _d in "$SCAN_DIR/api" "$SCAN_DIR/api-discovery" "$SCAN_DIR/api_discovery"; do
+              if [ -d "$_d" ]; then
+                _f=$(find "$_d" -maxdepth 3 -name "api-discovery.json" -type f 2>/dev/null | head -1)
+                if [ -n "$_f" ] && [ -s "$_f" ]; then API_FILE="$_f"; break; fi
+              fi
+            done
+          fi
+          if [ -n "$API_FILE" ]; then
+            echo "🌐 Sending API discovery: $API_FILE ($(wc -c < "$API_FILE" 2>/dev/null || echo '?') bytes)"
+            echo "  Preview: $(head -c 300 "$API_FILE")"
+            send_scan 'api-discovery' "$API_FILE"
+          else
+            echo "ℹ  api-discovery: $SCAN_DIR/api/api-discovery.json not found"
+            echo "  api dir contents:"
+            find "$SCAN_DIR/api" -maxdepth 4 -printf "%M %10s  %p\n" 2>/dev/null | head -10 || echo "  (dir missing)"
+            echo "  Any api-discovery.json anywhere under scan dir:"
+            find "$SCAN_DIR" -maxdepth 6 -name "api-discovery.json" 2>/dev/null | head -5 || echo "  (none)"
+          fi
+
+      # ── 8. Signal completion or failure ──────────────────────────────────────
+      - name: Notify BARBATOS – complete
+        if: always() && success()
+        run: |
+          HTTP=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 10 --max-time 30 \
+            -X POST "$CALLBACK" \
+            -H "Content-Type: application/json" \
+            -H "X-Barbatos-Job-Id: $JOB_ID" \
+            -H "X-Barbatos-Secret: $SECRET" \
+            -d '{"done": true}' 2>/dev/null || echo "000")
+          if [ "$HTTP" -ge 200 ] && [ "$HTTP" -lt 300 ]; then
+            echo "✅ BARBATOS notified: job $JOB_ID complete"
+          elif [ "$HTTP" = "000" ]; then
+            echo "⚠  Completion signal not delivered — BARBATOS was unreachable (no response). Job $JOB_ID results are saved in artifacts. You can manually import them into BARBATOS."
+          elif [ "$HTTP" = "404" ]; then
+            echo "⚠  Completion signal returned 404 — BARBATOS lost job $JOB_ID (server may have restarted). Results are saved in artifacts. Re-trigger the scan from BARBATOS to start a new job."
+          else
+            echo "⚠  Completion signal returned HTTP $HTTP. Job $JOB_ID results are saved in artifacts."
+          fi
+
+      - name: Notify BARBATOS – failure
+        if: failure()
+        run: |
+          curl -s --connect-timeout 10 --max-time 30 \
+            -X POST "$CALLBACK" \
+            -H "Content-Type: application/json" \
+            -H "X-Barbatos-Job-Id: $JOB_ID" \
+            -H "X-Barbatos-Secret: $SECRET" \
+            -d '{"error": "GitHub Actions workflow failed — check the Actions log for details."}' \
+            || true
+
+      # ── 9. Upload full scan results as artifacts (always available) ───────────
+      - name: Copy scan results to runner-owned staging directory
+        if: always()
+        run: |
+          # Docker-based scanners (ClamAV, Trivy, Grype, Syft) write files as root
+          # inside the container. In-place chown can still fail on certain kernel
+          # configurations. The safest approach: sudo-copy everything to a fresh
+          # temp directory, then chown the copy — the runner owns those new inodes.
+          source /tmp/security-scan-env
+          STAGING="/tmp/security-scan-artifact-staging"
+          sudo mkdir -p "$STAGING"
+          sudo cp -a "$SCAN_DIR/." "$STAGING/"
+          sudo chown -R "$(id -u):$(id -g)" "$STAGING"
+          chmod -R u+rX "$STAGING"
+          echo "STAGING=$STAGING" >> /tmp/security-scan-env
+          echo "✅ Staging ready: $STAGING"
+
+      - name: Upload scan artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ${{ steps.init-scan.outputs.scan_id }}
+          path: /tmp/security-scan-artifact-staging/
+          retention-days: 30
+
+
