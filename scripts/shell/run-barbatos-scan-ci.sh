@@ -304,7 +304,7 @@ run_group "Apply Suppression Rules" bash -lc '
       || echo "[WARNING] Could not write filtered findings — tickets will use raw summary"
   else
     # No active suppressions — write an identical filtered copy so downstream
-    # steps (create-jira-tickets.sh) always find a consistent file name.
+    # steps always find a consistent file name.
     cp "$FINDINGS_SUMMARY" "$FILTERED_SUMMARY" \
       && echo "[INFO] No suppressions active — copied raw summary to: $FILTERED_SUMMARY" \
       || echo "[WARNING] Could not copy findings summary"

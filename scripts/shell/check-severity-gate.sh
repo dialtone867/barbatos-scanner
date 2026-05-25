@@ -110,7 +110,7 @@ if [[ -f "$FINDINGS_SUMMARY" ]]; then
         echo -e "${YELLOW}  After tool suppression — Critical: $TOTAL_CRITICAL | High: $TOTAL_HIGH | Medium: $TOTAL_MEDIUM | Low: $TOTAL_LOW${NC}"
 
         # Write a filtered copy of the findings JSON so downstream steps (GitHub issues,
-        # JIRA tickets, dashboard) also see only non-suppressed findings.
+        # dashboard) also see only non-suppressed findings.
         FILTERED_SUMMARY="${FINDINGS_SUMMARY%.json}-filtered.json"
         JQ_FILTER_PROGRAM="
             .critical_findings = [.critical_findings[] | ${FILTER_EXPR}] |
